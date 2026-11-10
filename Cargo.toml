@@ -1,0 +1,86 @@
+[package]
+name = "zuqe-whatwg"
+version = "0.1.0"
+edition = "2024"
+description = "WHATWG standard Web API implementations for the zuqe JavaScript runtime"
+license = "Apache-2.0"
+keywords = ["whatwg", "web-api", "fetch", "streams", "url"]
+categories = ["web-programming", "api-bindings"]
+
+[features]
+# WHATWG fetch: browser semantics (CORS + shared cookie jar)
+fetch_cors_cookie = []
+# WHATWG fetch: HTTP cache + `caches` / `CacheStorage` globals
+fetch_cache = []
+
+[[example]]
+name = "wpt_runtime"
+required-features = ["fetch_cors_cookie", "fetch_cache"]
+
+[dependencies]
+zuqe = { path = "../../zhuque", features = [
+    "jit",
+    "gc_generations",
+    "crossbeam_channel",
+    "serde_json_support",
+    "persistent",
+    "child_runtime",
+    "intl402",
+] }
+crossbeam = "0.8"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "net",
+    "time",
+    "fs",
+    "io-std",
+    "process",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "http2",
+    "rustls",
+    "cookies",
+] }
+# direct dep for `hyper::ext::ReasonPhrase` (reqwest doesn't re-export it)
+hyper = { version = "1", default-features = false, features = ["http1"] }
+log = "0.4"
+futures-util = "0.3"
+uuid = { version = "1", default-features = false, features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+url = "2"
+cookie_store = "0.22"
+base64 = "0.22"
+sha2 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
+aes-gcm = "0.11"
+rand = "0.9"
+subtle = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Registry",
+    "Win32_UI_HiDpi",
+] }
+rappct = "0.13"
+
+[dev-dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
