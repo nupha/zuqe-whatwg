@@ -6,10 +6,13 @@
 //!   wpt_runtime <script.js>
 
 use std::{
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
 };
+
+use futures_util::FutureExt;
 
 use clap::Parser;
 use zuqe::{
@@ -49,7 +52,9 @@ fn collect_tests(inputs: &[PathBuf], root: Option<&Path>) -> Vec<PathBuf> {
         if p.is_dir() {
             let mut stack = vec![p];
             while let Some(dir) = stack.pop() {
-                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
                 let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
                 entries.sort_by_key(|e| e.path());
                 for e in entries.into_iter().rev() {
@@ -244,12 +249,19 @@ Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
         Ok::<(), i32>(())
     }) {
         Ok(c) => c,
-        Err(_) => return (0, 1, vec![format!("{}: failed to create context", file.display())]),
+        Err(_) => {
+            return (
+                0,
+                1,
+                vec![format!("{}: failed to create context", file.display())],
+            );
+        }
     };
 
     let eval_err = ctx.with_root_scope(|mut cx| -> Result<(), String> {
         eval_script(&mut cx, setup, "<wpt-setup>").map_err(|e| format!("setup: {e}"))?;
-        eval_script(&mut cx, testharness, "<testharness>").map_err(|e| format!("testharness: {e}"))?;
+        eval_script(&mut cx, testharness, "<testharness>")
+            .map_err(|e| format!("testharness: {e}"))?;
         eval_script(&mut cx, hook2, "<wpt-hook2>").map_err(|e| format!("hook2: {e}"))?;
         eval_script(&mut cx, &format!("{code}\n"), &file_name).map_err(|e| format!("test: {e}"))?;
         eval_script(&mut cx, finish, "<wpt-finish>").map_err(|e| format!("finish: {e}"))?;
@@ -359,7 +371,11 @@ async fn run_script_file(rt: &mut Runtime, file: &Path) -> ExitCode {
         .eval_wait(
             code.as_bytes(),
             &EvalName::BaseUrl(url),
-            if is_module { EvalType::Module } else { EvalType::Global },
+            if is_module {
+                EvalType::Module
+            } else {
+                EvalType::Global
+            },
             EvalFlags::empty(),
         )
         .await;
@@ -399,7 +415,10 @@ async fn main() -> ExitCode {
     rt.set_module_loader(js_module_loader);
 
     let looks_wpt = args.inputs.iter().any(|p| {
-        p.to_string_lossy().contains(".any.") || p.is_dir() || args.testharness.is_some() || args.root.is_some()
+        p.to_string_lossy().contains(".any.")
+            || p.is_dir()
+            || args.testharness.is_some()
+            || args.root.is_some()
     });
 
     if !looks_wpt && args.inputs.len() == 1 && args.inputs[0].is_file() {
@@ -418,7 +437,10 @@ async fn main() -> ExitCode {
     let testharness = match std::fs::read_to_string(&testharness_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wpt_runtime: cannot read testharness.js at {}: {e}", testharness_path.display());
+            eprintln!(
+                "wpt_runtime: cannot read testharness.js at {}: {e}",
+                testharness_path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -435,16 +457,38 @@ async fn main() -> ExitCode {
     let timeout = Duration::from_millis(args.timeout_ms);
     for t in &tests {
         println!("# running {}", t.display());
-        let (p, f, fails) = run_wpt_file(&mut rt, &testharness, t, timeout).await;
+        let run = AssertUnwindSafe(run_wpt_file(&mut rt, &testharness, t, timeout)).catch_unwind();
+        let (p, f, fails) = match run.await {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "non-string panic payload".to_string()
+                };
+                (0, 1, vec![format!("PANIC {}: {msg}", t.display())])
+            }
+        };
         total_pass += p;
         total_fail += f;
         all_failures.extend(fails);
         let status = if f == 0 { "PASS" } else { "FAIL" };
         println!("{status} {} ({} passed, {} failed)", t.display(), p, f);
     }
-    println!("\n# TOTAL: {} passed, {} failed, {} files", total_pass, total_fail, tests.len());
+    println!(
+        "\n# TOTAL: {} passed, {} failed, {} files",
+        total_pass,
+        total_fail,
+        tests.len()
+    );
     for f in &all_failures {
         println!("{f}");
     }
-    if total_fail == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if total_fail == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }

@@ -396,7 +396,7 @@ pub(crate) fn lookup_validators(
     if !method.eq_ignore_ascii_case("GET") {
         return None;
     }
-    let cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let entries = cache.get(&(method.to_ascii_uppercase(), cache_key_url(url)))?;
     // A response that varies on fields this request does not match is not
     // revalidateable either (WPT `http-cache/vary`).
@@ -415,7 +415,7 @@ pub(crate) fn lookup_full(
     if !method.eq_ignore_ascii_case("GET") {
         return None;
     }
-    let cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let entries = cache.get(&(method.to_ascii_uppercase(), cache_key_url(url)))?;
     // Reuse only a stored variant matching this request; `select_variant`
     // already rejects `Vary: *` (WPT request-cache-force-cache, http-cache/vary).
@@ -525,7 +525,7 @@ pub(crate) fn partial_remainder_range(
     if !method.eq_ignore_ascii_case("GET") {
         return None;
     }
-    let cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let entries = cache.get(&(method.to_ascii_uppercase(), cache_key_url(url)))?;
     let entry = select_variant(entries, req_headers)?;
     if entry.status != 206 {
@@ -695,7 +695,7 @@ pub(crate) fn store(
         })
         .unwrap_or_default();
 
-    let mut cache = CACHE.lock().unwrap();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let key = (method.to_ascii_uppercase(), cache_key_url(url));
     let entry = CacheEntry {
         status,
@@ -737,7 +737,7 @@ pub(crate) fn store(
 pub(crate) fn invalidate(url: &str) {
     CACHE
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .remove(&("GET".to_string(), cache_key_url(url)));
 }
 
@@ -751,7 +751,7 @@ fn merge_and_update(
     req_headers: &[(String, String)],
     update: &[(String, String)],
 ) {
-    let mut cache = CACHE.lock().unwrap();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let key = (method.to_ascii_uppercase(), cache_key_url(url));
     let Some(entries) = cache.get_mut(&key) else {
         return;
@@ -789,13 +789,13 @@ pub(crate) fn take_not_modified(
     }
     let key = (method.to_ascii_uppercase(), cache_key_url(url));
     let cached_status = {
-        let cache = CACHE.lock().unwrap();
+        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let entries = cache.get(&key)?;
         select_variant(entries, req_headers)?.status
     };
     // Merge 304 headers onto the stored headers.
     merge_and_update(method, url, req_headers, not_modified_headers);
-    let cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let entries = cache.get(&key)?;
     let entry = select_variant(entries, req_headers)?;
     Some((cached_status, entry.headers.clone(), entry.body.clone()))

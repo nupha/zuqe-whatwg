@@ -218,7 +218,7 @@ impl ResponsePayload {
                     }
                 }
             });
-            Some(BodySource::Channel(self.body_rx.clone().unwrap()))
+            self.body_rx.clone().map(BodySource::Channel)
         } else if let Some(bytes) = self.synthetic_body.clone() {
             Some(BodySource::Synthetic(bytes))
         } else {

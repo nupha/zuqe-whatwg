@@ -198,7 +198,7 @@ impl SharedCookieJar {
             .into_iter();
         self.store
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .store_response_cookies(cookies, url);
     }
 
@@ -208,7 +208,7 @@ impl SharedCookieJar {
         let s = self
             .store
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get_request_values(url)
             .map(|(name, value)| format!("{name}={value}"))
             .collect::<Vec<_>>()
@@ -222,7 +222,7 @@ impl SharedCookieJar {
     /// Run `f` with read access to the underlying store (Cookie Store API).
     #[cfg(feature = "fetch_cors_cookie")]
     pub(crate) fn with_store<R>(&self, f: impl FnOnce(&cookie_store::CookieStore) -> R) -> R {
-        f(&self.store.read().unwrap())
+        f(&self.store.read().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -257,7 +257,7 @@ pub(crate) fn cookie_order_record(set_cookie: &str) {
     if name.is_empty() {
         return;
     }
-    let mut order = global_cookie_order().write().unwrap();
+    let mut order = global_cookie_order().write().unwrap_or_else(|e| e.into_inner());
     // Re-register on every `Set-Cookie`: move the name to the end rather than
     // keeping its first-ever position. The table is process-global and never
     // pruned, so a stale entry left by an earlier test or file would otherwise
@@ -272,7 +272,7 @@ pub(crate) fn cookie_order_record(set_cookie: &str) {
 /// Names not in the recorded order (e.g. overwritten/expired) are kept at the
 /// end in their original relative order.
 pub(crate) fn reorder_cookie_header(value: &str) -> String {
-    let order = global_cookie_order().read().unwrap();
+    let order = global_cookie_order().read().unwrap_or_else(|e| e.into_inner());
     let mut pairs: Vec<(usize, &str)> = value
         .split("; ")
         .map(|pair| {

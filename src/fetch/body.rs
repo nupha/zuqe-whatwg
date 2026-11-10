@@ -277,8 +277,15 @@ pub(crate) fn drain_body(
                             Ok(JobState::Block)
                         };
                     }
-                    let mut guard = buf.lock().unwrap();
-                    let inner = guard.as_mut().unwrap();
+                    let mut guard = buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(inner) = guard.as_mut() else {
+                        committed.store(true, Ordering::SeqCst);
+                        return if result_slot.is_empty() {
+                            Ok(JobState::Done)
+                        } else {
+                            Ok(JobState::Block)
+                        };
+                    };
                     let finish = |guard: &mut std::sync::MutexGuard<Option<Vec<u8>>>| {
                         guard.take();
                         committed.store(true, Ordering::SeqCst);
@@ -308,7 +315,7 @@ pub(crate) fn drain_body(
                                 return Ok(JobState::Block);
                             }
                             Err(TryRecvError::Disconnected) => {
-                                let full = guard.take().unwrap();
+                                let full = guard.take().unwrap_or_default();
                                 committed.store(true, Ordering::SeqCst);
                                 let _ = result_slot.commit(Ok(full));
                                 cx.wake_handle().wake();

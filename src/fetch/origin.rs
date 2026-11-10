@@ -19,22 +19,46 @@ use zuqe::ScopedContext;
 /// so each probe takes/discards its error.
 #[cfg(feature = "fetch_cors_cookie")]
 pub(crate) fn resolve_client_origin(ctx: &mut ScopedContext) -> (Option<String>, Option<String>) {
-    let loc = ctx
-        .global_obj()
-        .get_property_str(ctx, "self")
-        .ok()
+    let selfv = match ctx.global_obj().get_property_str(ctx, "self") {
+        Ok(v) => Some(v),
+        Err(_) => {
+            ctx.take_exception();
+            None
+        }
+    };
+    let loc = selfv
         .filter(|selfv| !selfv.is_undefined_or_null())
-        .and_then(|selfv| selfv.get_property_str(ctx, "location").ok());
+        .and_then(|selfv| match selfv.get_property_str(ctx, "location") {
+            Ok(v) => Some(v),
+            Err(_) => {
+                ctx.take_exception();
+                None
+            }
+        });
+
     let origin = loc
         .as_ref()
-        .and_then(|loc| loc.get_property_str(ctx, "origin").ok())
+        .and_then(|loc| match loc.get_property_str(ctx, "origin") {
+            Ok(v) => Some(v),
+            Err(_) => {
+                ctx.take_exception();
+                None
+            }
+        })
         .and_then(|o| js_string_of(ctx, &o))
         .filter(|s| !s.is_empty());
     let url = loc
         .as_ref()
-        .and_then(|loc| loc.get_property_str(ctx, "href").ok())
+        .and_then(|loc| match loc.get_property_str(ctx, "href") {
+            Ok(v) => Some(v),
+            Err(_) => {
+                ctx.take_exception();
+                None
+            }
+        })
         .and_then(|h| js_string_of(ctx, &h))
         .filter(|s| !s.is_empty());
+
     // WPT runner shim: when the JS `self.location` shim is unavailable (e.g.
     // the engine's `self` is a native object the runner can't decorate), the
     // runner injects the document URL/origin here so the default referrer and
@@ -63,9 +87,13 @@ fn js_string_of(ctx: &mut ScopedContext, v: &JSValue) -> Option<String> {
     if v.is_undefined_or_null() {
         None
     } else {
-        v.to_string(ctx)
-            .ok()
-            .map(|s| s.content().encode_utf8(false).to_string())
+        match v.to_string(ctx) {
+            Ok(s) => Some(s.content().encode_utf8(false).to_string()),
+            Err(_) => {
+                ctx.take_exception();
+                None
+            }
+        }
     }
 }
 
@@ -73,17 +101,26 @@ fn js_string_of(ctx: &mut ScopedContext, v: &JSValue) -> Option<String> {
 /// or empty.
 #[cfg(feature = "fetch_cors_cookie")]
 fn global_string(ctx: &mut ScopedContext, key: &str) -> Option<String> {
-    ctx.global_obj()
-        .get_property_str(ctx, key)
-        .ok()
-        .and_then(|v| {
+    match ctx.global_obj().get_property_str(ctx, key) {
+        Ok(v) => {
             if v.is_undefined_or_null() {
                 None
             } else {
-                v.to_string(ctx)
-                    .ok()
-                    .map(|s| s.content().encode_utf8(false).to_string())
+                match v.to_string(ctx) {
+                    Ok(s) => {
+                        let s = s.content().encode_utf8(false).to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    }
+                    Err(_) => {
+                        ctx.take_exception();
+                        None
+                    }
+                }
             }
-        })
-        .filter(|s| !s.is_empty())
+        }
+        Err(_) => {
+            ctx.take_exception();
+            None
+        }
+    }
 }

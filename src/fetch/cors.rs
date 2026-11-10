@@ -827,7 +827,7 @@ mod preflight {
 
     /// Whether a valid (unexpired) cached preflight exists for `key`.
     fn preflight_cache_hit(key: &str) -> bool {
-        let mut cache = preflight_cache().lock().unwrap();
+        let mut cache = preflight_cache().lock().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_secs();
         match cache.get(key) {
             Some(e) if e.expiry_secs > now => true,
@@ -846,7 +846,7 @@ mod preflight {
         if max_age == 0 {
             return;
         }
-        let mut cache = preflight_cache().lock().unwrap();
+        let mut cache = preflight_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(
             key.to_string(),
             PreflightCacheEntry {

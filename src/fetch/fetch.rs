@@ -145,7 +145,6 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
                 .to_string();
         }
     }
-
     // Fetch spec: the request URL is serialized "with the exclude fragment
     // flag set" — the fragment is never sent and never appears in
     // `response.url`. Parsing also normalizes the URL (e.g. an empty path
@@ -256,43 +255,39 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
             }
         }
 
-        let mut read_str = |o: Object, key: &str| -> Option<String> {
-            let v = o.get_property_str(ctx, key).ok()?;
+        let mut read_str = |o: Object, key: &str| -> Result<Option<String>, i32> {
+            let v = o.get_property_str(ctx, key)?;
             if v.is_undefined() {
-                None
+                Ok(None)
             } else {
-                Some(
-                    v.to_string(ctx)
-                        .ok()?
-                        .content()
-                        .encode_utf8(false)
-                        .to_string(),
-                )
+                Ok(Some(
+                    v.to_string(ctx)?.content().encode_utf8(false).to_string(),
+                ))
             }
         };
-        if let Some(v) = read_str(o, "credentials") {
+        if let Some(v) = read_str(o, "credentials")? {
             credentials = v;
         }
-        if let Some(v) = read_str(o, "referrer") {
+        if let Some(v) = read_str(o, "referrer")? {
             referrer = v;
         }
-        if let Some(v) = read_str(o, "referrerPolicy") {
+        if let Some(v) = read_str(o, "referrerPolicy")? {
             referrer_policy = v;
         }
-        if let Some(v) = read_str(o, "integrity") {
+        if let Some(v) = read_str(o, "integrity")? {
             integrity = v;
         }
-        if let Some(v) = read_str(o, "mode") {
+        if let Some(v) = read_str(o, "mode")? {
             mode = v;
         }
-        if let Some(v) = read_str(o, "cache") {
+        if let Some(v) = read_str(o, "cache")? {
             cache_mode = v;
         }
         // Validate `priority` eagerly: an invalid RequestInit member value
         // must reject the fetch with a TypeError (WPT request-init-priority).
         // The valid set is `high` | `low` | `auto`; `high`/`low` are accepted
         // as hints and otherwise ignored, `auto` is the effective default.
-        if let Some(v) = read_str(o, "priority") {
+        if let Some(v) = read_str(o, "priority")? {
             const VALID: &[&str] = &["high", "low", "auto"];
             if !VALID.contains(&v.as_str()) {
                 return Err(
@@ -342,6 +337,7 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     if client_origin.is_none() && credentials == "same-origin" {
         credentials = String::from("include");
     }
+
 
     // CORS tainting: a cross-origin request in `cors` mode. These require
     // origin/ACAO handling and (for non-safelisted requests) a preflight.
@@ -431,6 +427,7 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         );
     }
 
+
     #[cfg(feature = "fetch_cache")]
     if let Some(hit) = cache_hit {
         // `only-if-cached` requires `mode: "same-origin"`; if the cached
@@ -477,6 +474,7 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         // `fetch()` returns a promise; resolve it with the cached Response.
         return Promise::from_resolve_value(ctx, response).map(JSValue::from);
     }
+
 
     // RFC 9111 §3.3: a stored *incomplete* (`206`) response cannot be served
     // for a request for the complete resource, but the fetch is completed by
@@ -1400,11 +1398,23 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 
                     match bytes {
                         Ok(b) => {
-                            let mut req = req.take().expect("stream drain job ran twice");
+                            let Some(mut req) = req.take() else {
+                                let _ = fail_slot.commit(Err(FetchError::Other(TransportError {
+                                    code: "body",
+                                    message: "request failed: stream drain job ran twice".into(),
+                                })));
+                                return Ok(JobState::Done);
+                            };
                             set_content_length(&mut req.headers, b.len());
                             req.body = Some(b);
 
-                            let spawn = spawn_request.take().expect("dispatcher already used");
+                            let Some(spawn) = spawn_request.take() else {
+                                let _ = fail_slot.commit(Err(FetchError::Other(TransportError {
+                                    code: "body",
+                                    message: "request failed: dispatcher already used".into(),
+                                })));
+                                return Ok(JobState::Done);
+                            };
                             spawn(req);
                         }
                         // The stream errored or produced a bad chunk; surface it
