@@ -76,6 +76,12 @@ impl WhatwgState {
         Self::default()
     }
 
+    /// Cancel every pending `setTimeout`/`setInterval` callback. Intended for
+    /// hosts that reuse one runtime across isolated test contexts (WPT runner).
+    pub fn clear_timers(&mut self) {
+        self.timers.clear();
+    }
+
     /// Borrow the host's WHATWG state for the current context.
     pub(crate) fn of<'a, 'c>(ctx: &'a mut ScopedContext<'c>) -> &'a mut Self {
         let accessor = STATE_ACCESSOR

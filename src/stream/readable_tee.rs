@@ -13,7 +13,7 @@ use std::{
 use zuqe::{
     Array, CallContext, Callback, JSResult, JSValue, NativeObject, ScopedContext,
     builtins::{promise::Promise, typed_array::TypedArray},
-    gc_lite::{GcTrace, GcTraceCtx},
+    gc_lite::GcTrace,
 };
 
 use crate::state::WhatwgState;

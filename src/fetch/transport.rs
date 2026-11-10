@@ -449,6 +449,7 @@ fn response_header_list(resp: &reqwest::Response) -> crate::fetch::headers::Head
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn follow_redirects<F, Fut>(
     rc: &ReferrerCtx,
     start_url: &str,

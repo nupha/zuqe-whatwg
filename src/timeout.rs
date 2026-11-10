@@ -13,8 +13,8 @@
 use std::time::{Duration, Instant};
 
 use zuqe::{
-    CallContext, Callback, Exception, JS_PROP_C_W_E, JSResult, JSValue, JobState, Object,
-    ScopedContext, gc_lite::GcTrace,
+    CallContext, Callback, EvalFlags, EvalName, EvalType, Exception, JS_PROP_C_W_E, JSResult,
+    JSValue, JobState, Object, ScopedContext, gc_lite::GcTrace,
 };
 
 use crate::state::WhatwgState;
@@ -29,8 +29,11 @@ struct TimerEntry {
     /// Stable id returned to JS and used by clearTimeout/clearInterval. Never
     /// reused, so a stale clear can't hit a later timer that recycled the id.
     id: u32,
-    /// JS function callback — must be GC-traced
-    callback: Object,
+    /// JS function callback — must be GC-traced. `None` when the timer was
+    /// registered with a code string (WebIDL `TimerHandler` union).
+    callback: Option<Object>,
+    /// Code-string handler to evaluate when the timer fires.
+    code: Option<String>,
     /// None for setTimeout; Some(ms) for setInterval
     interval_ms: Option<u64>,
     /// Absolute deadline captured at registration (and on every re-arm for
@@ -48,6 +51,15 @@ pub(crate) struct TimerState {
     entries: Vec<TimerEntry>,
     /// Whether a polling job is currently queued for this runtime.
     job_active: bool,
+}
+
+impl TimerState {
+    /// Drop all pending timers and allow a fresh polling job to start. Used by
+    /// hosts that share one runtime across independent test contexts.
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.job_active = false;
+    }
 }
 
 fn next_timer_id(ctx: &mut ScopedContext) -> u32 {
@@ -93,7 +105,7 @@ fn start_timer_task(ctx: &mut ScopedContext) {
 
             // At least one timer is due: fire every elapsed timer in order.
             loop {
-                let step: Option<(Object, Option<u64>, u32)> = {
+                let step: Option<(Option<Object>, Option<String>, Option<u64>, u32)> = {
                     let s = &mut WhatwgState::of(cx).timers;
                     let Some(e) = s.entries.first_mut() else {
                         break;
@@ -102,33 +114,40 @@ fn start_timer_task(ctx: &mut ScopedContext) {
                         break;
                     }
                     let cb = e.callback;
+                    let code = e.code.clone();
                     let id = e.id;
                     match e.interval_ms {
                         // One-shot: drop it before invoking (a clearTimeout
                         // inside the callback is then a no-op).
                         None => {
                             s.entries.remove(0);
-                            Some((cb, None, id))
+                            Some((cb, code, None, id))
                         }
                         // Interval: keep the entry; re-arm after the callback.
-                        Some(ms) => Some((cb, Some(ms), id)),
+                        Some(ms) => Some((cb, code, Some(ms), id)),
                     }
                 };
 
-                let (cb, interval_ms, id) = match step {
+                let (cb, code, interval_ms, id) = match step {
                     Some(x) => x,
                     None => break,
                 };
 
-                if cb.call(cx, JSValue::UNDEFINED, &[]).is_err() {
-                    // Take the exception FIRST so cur_exception is cleared before
-                    // any further JS runs (to_text).
-                    let _exc = cx.take_exception();
-                    #[cfg(debug_assertions)]
-                    {
-                        let msg = _exc.to_text(cx);
-                        eprintln!("timer callback error: {}", msg.message);
-                    }
+                let result = match (cb, code) {
+                    (_, Some(code)) => cx
+                        .eval(
+                            code.as_bytes(),
+                            &EvalName::Name("<timer>".to_string()),
+                            EvalType::Global,
+                            EvalFlags::empty(),
+                        )
+                        .map(|_| ()),
+                    (Some(cb), None) => cb.call(cx, JSValue::UNDEFINED, &[]).map(|_| ()),
+                    (None, None) => Ok(()),
+                };
+                if result.is_err() {
+                    let exc = cx.take_exception();
+                    crate::helpers::report_exception(cx, exc);
                 }
 
                 if let Some(ms) = interval_ms {
@@ -174,7 +193,15 @@ fn start_timer_task(ctx: &mut ScopedContext) {
 // ---------------------------------------------------------------------------
 
 fn register_timer(ctx: &mut ScopedContext, cc: CallContext, is_interval: bool) -> JSResult {
-    let callback = cc.arg(0).ensure_callable(ctx)?;
+    // WebIDL `TimerHandler` is `(Function or DOMString)`: callable values are
+    // called, everything else is stringified and evaluated when it fires.
+    let arg = cc.arg(0);
+    let (callback, code) = if arg.is_callable() {
+        (Some(arg.ensure_callable(ctx)?), None)
+    } else {
+        let s = arg.to_string(ctx)?.content().encode_utf8(false).to_string();
+        (None, Some(s))
+    };
     let delay_ms = if cc.length() >= 2 {
         cc.arg(1).to_number(ctx)?.to_i32().max(0) as u64
     } else {
@@ -190,6 +217,7 @@ fn register_timer(ctx: &mut ScopedContext, cc: CallContext, is_interval: bool) -
             TimerEntry {
                 id,
                 callback,
+                code,
                 interval_ms: if is_interval { Some(delay_ms) } else { None },
                 deadline,
             },
@@ -234,7 +262,8 @@ pub fn register_timer_once(ctx: &mut ScopedContext, callback: JSValue, ms: u64) 
             &mut s.entries,
             TimerEntry {
                 id,
-                callback,
+                callback: Some(callback),
+                code: None,
                 interval_ms: None,
                 deadline,
             },

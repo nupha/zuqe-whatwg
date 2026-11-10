@@ -16,13 +16,16 @@ use std::collections::{HashMap, HashSet};
 
 use zuqe::{
     Array, CallContext, Callback, Exception, JS_CLASS_ARRAY, JS_CLASS_ARRAY_BUFFER,
-    JS_CLASS_BOOLEAN, JS_CLASS_DATE, JS_CLASS_ERROR, JS_CLASS_MAP, JS_CLASS_NUMBER,
-    JS_CLASS_OBJECT, JS_CLASS_REGEXP, JS_CLASS_SET, JS_CLASS_SHARED_ARRAY_BUFFER, JS_CLASS_STRING,
-    JS_CLASS_WEAKMAP, JS_CLASS_WEAKSET, JS_GPN_ENUM_ONLY, JS_GPN_STR_OR_INT_MASK, JSResult,
-    JSValue, Object, ScopedContext, builtins::array_buffer::ArrayBuffer,
+    JS_CLASS_BIG_INT, JS_CLASS_BOOLEAN, JS_CLASS_DATE, JS_CLASS_ERROR, JS_CLASS_MAP,
+    JS_CLASS_NUMBER, JS_CLASS_OBJECT, JS_CLASS_REGEXP, JS_CLASS_SET, JS_CLASS_SHARED_ARRAY_BUFFER,
+    JS_CLASS_STRING, JS_CLASS_WEAKMAP, JS_CLASS_WEAKSET, JS_GPN_ENUM_ONLY, JS_GPN_STR_OR_INT_MASK,
+    JSResult, JSValue, Object, ScopedContext, builtins::array_buffer::ArrayBuffer,
 };
 
-use super::dom::make_dom_exception;
+use super::{
+    blob::{blob_bytes_of, blob_from_bytes, blob_type_of},
+    dom::make_dom_exception,
+};
 
 /// Throw a `DataCloneError` DOMException synchronously.
 fn throw_data_clone(ctx: &mut ScopedContext, message: &str) -> i32 {
@@ -65,6 +68,12 @@ pub(super) fn js_structured_clone(ctx: &mut ScopedContext, cc: CallContext) -> J
                     .is_some_and(|ab| ab.class_id() == JS_CLASS_ARRAY_BUFFER);
                 if !is_buffer {
                     return Err(throw_data_clone(ctx, "A transferable could not be cloned."));
+                }
+                if v.as_object_ArrayBuffer().is_some_and(|ab| ab.is_detached()) {
+                    return Err(throw_data_clone(
+                        ctx,
+                        "A detached ArrayBuffer cannot be transferred.",
+                    ));
                 }
                 transfer.insert(*v);
             }
@@ -111,6 +120,29 @@ fn clone_value(
     if let Some(dv) = value.as_object_DataView() {
         return clone_data_view(ctx, value, dv, memory, transfer);
     }
+    // Blob is a platform object serialized by value (bytes + type). A File
+    // (Blob subclass with a name) is re-created through the global `File`.
+    if let Some(bytes) = blob_bytes_of(&value) {
+        let type_ = blob_type_of(&value).unwrap_or_default();
+        let name = value.get_property_str(ctx, "name")?;
+        if !name.is_undefined() && !name.is_null() {
+            let blob = blob_from_bytes(ctx, bytes, type_.clone())?;
+            let mut opts = ctx.create_base_object()?;
+            let type_js = ctx.create_string_from_utf8(type_.into_bytes())?;
+            opts.set_property_str(ctx, "type", JSValue::make_string(type_js))?;
+            if let Ok(lm) = value.get_property_str(ctx, "lastModified") {
+                opts.set_property_str(ctx, "lastModified", lm)?;
+            }
+            let ctor = global_ctor(ctx, "File")?;
+            let parts = Array::from_values(ctx, vec![blob])?;
+            let clone = ctor.call_ctor(ctx, &[parts.into(), name, opts.into()])?;
+            memory.insert(value, clone);
+            return Ok(clone);
+        }
+        let clone = blob_from_bytes(ctx, bytes, type_)?;
+        memory.insert(value, clone);
+        return Ok(clone);
+    }
 
     match obj.class_id() {
         JS_CLASS_ARRAY => clone_container(ctx, value, memory, transfer, true),
@@ -121,10 +153,11 @@ fn clone_value(
         }
         JS_CLASS_DATE => clone_date(ctx, value),
         JS_CLASS_REGEXP => clone_regexp(ctx, value),
-        JS_CLASS_ERROR => clone_error(ctx, value),
+        JS_CLASS_ERROR => clone_error(ctx, value, memory, transfer),
         JS_CLASS_BOOLEAN => clone_wrapper(ctx, value, "Boolean"),
         JS_CLASS_NUMBER => clone_wrapper(ctx, value, "Number"),
         JS_CLASS_STRING => clone_wrapper(ctx, value, "String"),
+        JS_CLASS_BIG_INT => clone_wrapper(ctx, value, "BigInt"),
         JS_CLASS_OBJECT => clone_container(ctx, value, memory, transfer, false),
         _ => Err(throw_data_clone(ctx, "This value is not cloneable.")),
     }
@@ -143,13 +176,30 @@ fn clone_array_buffer(
             "A SharedArrayBuffer cannot be cloned.",
         ));
     }
+    if ab.is_detached() {
+        return Err(throw_data_clone(
+            ctx,
+            "A detached ArrayBuffer cannot be cloned.",
+        ));
+    }
 
     let len = ab.payload().byte_length();
+    let resizable = ab.payload().is_resizable();
+    let max = ab.payload().max_byte_length();
     let mut bytes = Vec::with_capacity(len);
     let mut ab_mut = ab;
     ab_mut.payload_mut().with_bytes_mut(|b| bytes = b.to_vec());
 
-    let mut clone = ArrayBuffer::create(ctx, false, len)?;
+    let mut clone = if resizable {
+        let mut opts = ctx.create_base_object()?;
+        opts.set_property_str(ctx, "maxByteLength", JSValue::from(max as i64))?;
+        let ctor = global_ctor(ctx, "ArrayBuffer")?;
+        let val = ctor.call_ctor(ctx, &[JSValue::from(len as i64), opts.into()])?;
+        val.as_object_ArrayBuffer()
+            .ok_or_else(|| ctx.throw_internal_error("failed to create ArrayBuffer clone"))?
+    } else {
+        ArrayBuffer::create(ctx, false, len)?
+    };
     clone
         .payload_mut()
         .with_bytes_mut(|b| b.copy_from_slice(&bytes));
@@ -172,6 +222,12 @@ fn clone_typed_array(
     transfer: &HashSet<JSValue>,
 ) -> Result<JSValue, i32> {
     let payload = ta.payload();
+    if payload.is_detached() {
+        return Err(throw_data_clone(
+            ctx,
+            "A detached ArrayBuffer cannot be cloned.",
+        ));
+    }
     let buffer = payload.array_buffer();
     // Read offset/count *before* cloning the buffer: a transferred buffer is
     // detached, which zeroes this view's length.
@@ -180,6 +236,8 @@ fn clone_typed_array(
         .to_number(ctx)?
         .to_f64() as u32;
     let count = payload.count();
+    let view_bytes = ta.byte_length();
+    let buffer_len = buffer.payload().byte_length();
     let buffer_clone = clone_value(ctx, buffer.into(), memory, transfer)?;
 
     // Same element type via the global constructor, e.g. `new Uint8Array(buf, o, n)`.
@@ -190,14 +248,21 @@ fn clone_typed_array(
         global_ctor(ctx, o.class_name_str())?
     };
 
-    let clone = ctor.call_ctor(
-        ctx,
-        &[
-            buffer_clone,
-            JSValue::from(offset as i32),
-            JSValue::from(count as i32),
-        ],
-    )?;
+    // A view that spans to the end of its buffer is length-tracked: omit the
+    // length argument so the clone keeps growing/shrinking with a resizable
+    // buffer (structured-clone serializes the view kind, not just its length).
+    let clone = if offset as usize + view_bytes == buffer_len {
+        ctor.call_ctor(ctx, &[buffer_clone, JSValue::from(offset as i32)])?
+    } else {
+        ctor.call_ctor(
+            ctx,
+            &[
+                buffer_clone,
+                JSValue::from(offset as i32),
+                JSValue::from(count as i32),
+            ],
+        )?
+    };
     memory.insert(value, clone);
 
     Ok(clone)
@@ -211,23 +276,32 @@ fn clone_data_view(
     transfer: &HashSet<JSValue>,
 ) -> Result<JSValue, i32> {
     let payload = dv.payload();
+    if payload.is_out_of_bounds() {
+        return Err(throw_data_clone(
+            ctx,
+            "An out-of-bounds DataView cannot be cloned.",
+        ));
+    }
     let buffer = payload.array_buffer();
-    let offset = value
-        .get_property_str(ctx, "byteOffset")?
-        .to_number(ctx)?
-        .to_f64() as u32;
+    let offset = payload.byte_offset() as u32;
     let byte_length = payload.view_byte_length();
+    let buffer_len = buffer.payload().byte_length();
     let buffer_clone = clone_value(ctx, buffer.into(), memory, transfer)?;
 
     let ctor = global_ctor(ctx, "DataView")?;
-    let clone = ctor.call_ctor(
-        ctx,
-        &[
-            buffer_clone,
-            JSValue::from(offset as i32),
-            JSValue::from(byte_length as i32),
-        ],
-    )?;
+    // Spanning to the buffer end marks a length-tracked view: omit the length.
+    let clone = if offset as usize + byte_length == buffer_len {
+        ctor.call_ctor(ctx, &[buffer_clone, JSValue::from(offset as i32)])?
+    } else {
+        ctor.call_ctor(
+            ctx,
+            &[
+                buffer_clone,
+                JSValue::from(offset as i32),
+                JSValue::from(byte_length as i32),
+            ],
+        )?
+    };
     memory.insert(value, clone);
     Ok(clone)
 }
@@ -251,25 +325,30 @@ fn clone_date(ctx: &mut ScopedContext, value: JSValue) -> Result<JSValue, i32> {
     ctor.call_ctor(ctx, &[JSValue::from(ts)])
 }
 
-/// Clone a RegExp via `new RegExp(source, flags)`, preserving `lastIndex`.
+/// Clone a RegExp via `new RegExp(source, flags)`. `lastIndex` is reset to 0
+/// (structured clone serializes only source/flags).
 fn clone_regexp(ctx: &mut ScopedContext, value: JSValue) -> Result<JSValue, i32> {
     let source = value.get_property_str(ctx, "source")?;
     let flags = value.get_property_str(ctx, "flags")?;
-    let last_index = value.get_property_str(ctx, "lastIndex")?;
 
     let ctor = global_ctor(ctx, "RegExp")?;
-    let clone = ctor.call_ctor(ctx, &[source, flags])?;
-    if !last_index.is_undefined_or_null() {
-        clone
-            .as_object()
-            .ok_or_else(|| ctx.throw_internal_error("not a RegExp"))?
-            .set_property_str(ctx, "lastIndex", last_index)?;
-    }
-    Ok(clone)
+    ctor.call_ctor(ctx, &[source, flags])
 }
 
-/// Clone an Error: name/message, with the prototype matching the name.
-fn clone_error(ctx: &mut ScopedContext, value: JSValue) -> Result<JSValue, i32> {
+/// Clone an Error: name/message/cause, with the prototype matching the name.
+/// `message` is only re-created when the source had its own property.
+fn clone_error(
+    ctx: &mut ScopedContext,
+    value: JSValue,
+    memory: &mut HashMap<JSValue, JSValue>,
+    transfer: &HashSet<JSValue>,
+) -> Result<JSValue, i32> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ctx.throw_internal_error("not an Error"))?;
+    let has_message = obj.has_own_property_str(ctx, "message")?;
+    let has_cause = obj.has_own_property_str(ctx, "cause")?;
+
     let name = value.get_property_str(ctx, "name")?.to_string(ctx)?;
     let name_str = name.content().encode_utf8(false).to_string();
     let msg = value.get_property_str(ctx, "message")?;
@@ -279,29 +358,80 @@ fn clone_error(ctx: &mut ScopedContext, value: JSValue) -> Result<JSValue, i32> 
         msg.to_string(ctx)?.content().encode_utf8(false).to_string()
     };
 
-    let clone = match name_str.as_str() {
-        "EvalError" => ctx.create_error_object(zuqe::ErrorKind::Eval, &msg_str, false),
-        "RangeError" => ctx.create_error_object(zuqe::ErrorKind::Range, &msg_str, false),
-        "ReferenceError" => ctx.create_error_object(zuqe::ErrorKind::Reference, &msg_str, false),
-        "SyntaxError" => ctx.create_error_object(zuqe::ErrorKind::Syntax, &msg_str, false),
-        "TypeError" => ctx.create_error_object(zuqe::ErrorKind::Type, &msg_str, false),
-        "URIError" => ctx.create_error_object(zuqe::ErrorKind::Uri, &msg_str, false),
+    let clone: JSValue = match name_str.as_str() {
+        "EvalError" => ctx
+            .create_error_object(zuqe::ErrorKind::Eval, &msg_str, false)
+            .map(JSValue::from)
+            .ok_or_else(|| ctx.throw_internal_error("failed to clone error"))?,
+        "RangeError" => ctx
+            .create_error_object(zuqe::ErrorKind::Range, &msg_str, false)
+            .map(JSValue::from)
+            .ok_or_else(|| ctx.throw_internal_error("failed to clone error"))?,
+        "ReferenceError" => ctx
+            .create_error_object(zuqe::ErrorKind::Reference, &msg_str, false)
+            .map(JSValue::from)
+            .ok_or_else(|| ctx.throw_internal_error("failed to clone error"))?,
+        "SyntaxError" => ctx
+            .create_error_object(zuqe::ErrorKind::Syntax, &msg_str, false)
+            .map(JSValue::from)
+            .ok_or_else(|| ctx.throw_internal_error("failed to clone error"))?,
+        "TypeError" => ctx
+            .create_error_object(zuqe::ErrorKind::Type, &msg_str, false)
+            .map(JSValue::from)
+            .ok_or_else(|| ctx.throw_internal_error("failed to clone error"))?,
+        "URIError" => ctx
+            .create_error_object(zuqe::ErrorKind::Uri, &msg_str, false)
+            .map(JSValue::from)
+            .ok_or_else(|| ctx.throw_internal_error("failed to clone error"))?,
         // Plain Error (or any other name → "Error" per spec).
         _ => {
             let msg_js = ctx.create_string_from_utf8(msg_str.as_bytes().to_vec())?;
             let ctor = global_ctor(ctx, "Error")?;
-            return ctor.call_ctor(ctx, &[JSValue::make_string(msg_js)]);
+            ctor.call_ctor(ctx, &[JSValue::make_string(msg_js)])?
         }
     };
-    clone
-        .map(JSValue::from)
-        .ok_or_else(|| ctx.throw_internal_error("failed to clone error"))
+
+    memory.insert(value, clone);
+    let mut clone_obj = clone
+        .as_object()
+        .ok_or_else(|| ctx.throw_internal_error("not an Error clone"))?;
+    if !has_message {
+        let _ = clone_obj.delete_property_str(ctx, "message");
+    }
+    if has_cause {
+        let cause = value.get_property_str(ctx, "cause")?;
+        let cause = clone_value(ctx, cause, memory, transfer)?;
+        clone_obj.set_property_str(ctx, "cause", cause)?;
+    }
+    Ok(clone)
 }
 
-/// Clone a Boolean/Number/String wrapper object via its constructor.
+/// Clone a Boolean/Number/String/BigInt wrapper object via its constructor.
 fn clone_wrapper(ctx: &mut ScopedContext, value: JSValue, ctor_name: &str) -> Result<JSValue, i32> {
-    let arg = value.to_string_or_symbol(ctx)?;
-    let ctor = global_ctor(ctx, ctor_name)?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ctx.throw_internal_error("not a wrapper object"))?;
+    let is_bigint = obj.class_id() == JS_CLASS_BIG_INT;
+    let arg = match obj.class_id() {
+        JS_CLASS_BOOLEAN => JSValue::from(
+            *obj.payload_bool()
+                .ok_or_else(|| ctx.throw_internal_error("not a Boolean wrapper"))?,
+        ),
+        JS_CLASS_NUMBER => *obj
+            .payload_value()
+            .ok_or_else(|| ctx.throw_internal_error("not a Number wrapper"))?,
+        JS_CLASS_STRING => JSValue::make_string(
+            *obj.payload_string()
+                .ok_or_else(|| ctx.throw_internal_error("not a String wrapper"))?,
+        ),
+        JS_CLASS_BIG_INT => JSValue::make_bigint(
+            *obj.payload_bigint()
+                .ok_or_else(|| ctx.throw_internal_error("not a BigInt wrapper"))?,
+        ),
+        _ => return Err(throw_data_clone(ctx, "This value is not cloneable.")),
+    };
+    // `BigInt` cannot be called with `new`; `Object(bigint)` creates the wrapper.
+    let ctor = global_ctor(ctx, if is_bigint { "Object" } else { ctor_name })?;
     ctor.call_ctor(ctx, &[arg])
 }
 

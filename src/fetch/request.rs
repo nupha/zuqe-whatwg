@@ -5,10 +5,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use zuqe::{
     CallContext, ClassCtorDef, Exception, FieldDef, JSResult, JSValue, NativeObject, Object,
-    ScopedContext, WriteBarrier,
-    builtins::promise::Promise,
-    def_native_object,
-    gc_lite::{GcTrace, GcTraceCtx},
+    ScopedContext, WriteBarrier, builtins::promise::Promise, def_native_object, gc_lite::GcTrace,
 };
 
 use crate::{

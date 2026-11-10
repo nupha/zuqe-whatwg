@@ -401,6 +401,60 @@ G.__wpt_results = [];
 G.__wpt_done = false;
 G.__wpt_result_cbs = [];
 G.__wpt_complete_cbs = [];
+// Minimal global EventTarget used by tests that observe uncaught exceptions
+// (`queueMicrotask`, timers). The real DOM EventTarget is not available here.
+G.__wpt_listeners = Object.create(null);
+G.addEventListener = function(type, cb){
+  if (!cb || (typeof cb !== 'function' && typeof cb.handleEvent !== 'function')) return;
+  (G.__wpt_listeners[type] || (G.__wpt_listeners[type] = [])).push(cb);
+};
+G.removeEventListener = function(type, cb){
+  var a = G.__wpt_listeners[type];
+  if (!a) return;
+  var i = a.indexOf(cb);
+  if (i >= 0) a.splice(i, 1);
+};
+G.dispatchEvent = function(ev){
+  var t = ev && ev.type;
+  var a = G.__wpt_listeners[t];
+  var ok = true;
+  if (a) {
+    a = a.slice();
+    for (var i = 0; i < a.length; i++) {
+      try {
+        var cb = a[i];
+        if (typeof cb === 'function') cb.call(G, ev);
+        else cb.handleEvent(ev);
+      } catch (e) { console.error(e); }
+    }
+  }
+  if (t === 'error' && typeof G.onerror === 'function') {
+    try {
+      if (G.onerror(ev.message, ev.filename, ev.lineno, ev.colno, ev.error) === false) ok = false;
+    } catch (e) {}
+  }
+  return ok;
+};
+// HTML "report an exception": used by queueMicrotask/timer callbacks.
+G.reportError = function(err){
+  G.dispatchEvent({
+    type: 'error', error: err,
+    message: (err && err.message !== undefined) ? String(err.message) : String(err),
+    filename: '', lineno: 0, colno: 0, cancelable: true
+  });
+};
+// File is a Blob subclass used by structured-clone/Blob WPTs; the crate does
+// not ship the File interface yet, so provide the minimal shape here.
+if (typeof G.File === 'undefined') {
+  G.File = class File extends Blob {
+    constructor(bits, name, opts) {
+      super(bits, opts);
+      this.name = String(name);
+      this.lastModified = (opts && opts.lastModified !== undefined)
+        ? Number(opts.lastModified) : Date.now();
+    }
+  };
+}
 G.add_result_callback = function(cb){
   var wrapped = function(test){
     try {
@@ -472,7 +526,7 @@ Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
 
     let eval_err = ctx.with_root_scope(|mut cx| -> Result<(), String> {
         eval_script(&mut cx, setup, "<wpt-setup>").map_err(|e| format!("setup: {e}"))?;
-        eval_script(&mut cx, testharness, "<testharness>")
+        eval_script_at(&mut cx, testharness, "<testharness>", Some(&doc_url))
             .map_err(|e| format!("testharness: {e}"))?;
         eval_script(&mut cx, hook2, "<wpt-hook2>").map_err(|e| format!("hook2: {e}"))?;
         eval_script(&mut cx, &location_setup_script(&doc_url), "<wpt-location>")
@@ -724,6 +778,9 @@ async fn run(args: Args) -> ExitCode {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     for t in &tests {
+        // Each file runs in a fresh context; drop timers left behind by the
+        // previous file so their polling job cannot strand this file's timers.
+        rt.user_state_mut::<WptState>().whatwg.clear_timers();
         println!("# running {}", t.display());
         let run = AssertUnwindSafe(run_wpt_file(
             &mut rt,

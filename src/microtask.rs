@@ -23,8 +23,8 @@ fn js_queue_microtask(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     ctx.queue_oneshot_job(
         move |cx| {
             if callback.call(cx, JSValue::UNDEFINED, &[]).is_err() {
-                let msg = cx.take_exception().to_text(cx);
-                eprintln!("queueMicrotask callback error: {}", msg.message);
+                let exc = cx.take_exception();
+                crate::helpers::report_exception(cx, exc);
             }
             Ok(())
         },

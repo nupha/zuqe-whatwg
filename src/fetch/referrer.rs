@@ -57,7 +57,7 @@ pub(crate) fn compute_request_referrer(
     // document URL; an explicit `referrer` may be absolute or relative and is
     // resolved against the document URL, then stripped of its fragment.
     let source: Option<String> = if referrer.is_empty() || referrer == "about:client" {
-        client_url.map(&strip_fragment)
+        client_url.map(strip_fragment)
     } else {
         let resolved = if let Ok(u) = url::Url::parse(referrer) {
             u.to_string()
