@@ -552,40 +552,95 @@ fn js_readable_stream_constructor(ctx: &mut ScopedContext, cc: CallContext) -> J
     // "Any thrown exceptions will be re-thrown by the ReadableStream()
     // constructor"); a start() returning a rejected promise errors the stream
     // asynchronously instead.
-    if let Some(o) = underlying_source.as_object() {
-        match o.invoke_str_defined(ctx, "start", &[start_controller]) {
-            Ok(Some(Err(_))) => {
+    let start_result = if let Some(o) = underlying_source.as_object() {
+        match o.invoke_str_defined(ctx, "start", &[start_controller])? {
+            Some(Err(_)) => {
                 // start() threw synchronously — leave the exception set and
                 // re-throw from the constructor.
                 return Err(-1);
             }
-            Ok(_) => {}
-            Err(_) => return Err(-1),
+            Some(Ok(v)) => Some(v),
+            None => None,
         }
+    } else {
+        None
+    };
+
+    // A start() promise rejection errors the stream ("deal with rejection").
+    // Fulfillment marks the controller started and may trigger the first pull.
+    let mut start_handled_by_promise = false;
+    if let Some(result) = start_result
+        && let Ok(mut start_promise) = Promise::try_from(result)
+    {
+        start_handled_by_promise = true;
+        let on_ok: JSValue = if is_bytes {
+            ctx.create_native_function(
+                Callback::Func(|_, _| Ok(JSValue::UNDEFINED)),
+                "readableStartOk",
+                0,
+                0,
+            )?
+            .into()
+        } else {
+            ctx.create_native_function_with_data(
+                Callback::Func(|cx, cc| mark_started_and_pull(cx, cc.data(0))),
+                "readableStartOk",
+                0,
+                0,
+                [start_controller].into(),
+            )?
+            .into()
+        };
+        let on_err: JSValue = ctx
+            .create_native_function_with_data(
+                Callback::Func(|cx, cc| {
+                    let c = cc.data(0);
+                    c.invoke_str(cx, "error", &[cc.arg(0)])?;
+                    Ok(JSValue::UNDEFINED)
+                }),
+                "readableStartErr",
+                1,
+                0,
+                [start_controller].into(),
+            )?
+            .into();
+        start_promise.perform_then(ctx, on_ok, on_err)?;
     }
 
     // Spec: once start() completes, pull() fires when the stream needs data.
     // This lets a pull-only source push its first chunk (or error the stream)
-    // without an explicit read. If a read already issued its own pull
-    // synchronously (e.g. pipeTo's first read), skip so we do not pull twice.
-    if !is_bytes {
+    // without an explicit read. Use a resolved-promise reaction (not a job) so
+    // start completion and the first pull run as a microtask, ordered before
+    // any promise continuations queued by the caller.
+    if !is_bytes && !start_handled_by_promise {
         let controller_val = JSValue::from(default_controller);
-        ctx.queue_job(
-            move |cx| {
-                let cp = JSReadableStreamDefaultController::payload_of(&controller_val)
-                    .ok_or_else(|| cx.throw_internal_error("invalid controller"))?;
-                cp.set_started(true);
-                let has_pending_read = !cp.pending_read().borrow().is_empty();
-                if !has_pending_read && cp.should_call_pull(cx)? {
-                    cp.call_pull(cx)?;
-                }
-                Ok(zuqe::JobState::Done)
-            },
-            controller_val,
-        );
+        let on_ok: JSValue = ctx
+            .create_native_function_with_data(
+                Callback::Func(|cx, cc| mark_started_and_pull(cx, cc.data(0))),
+                "readableStartOk",
+                0,
+                0,
+                [controller_val].into(),
+            )?
+            .into();
+        let mut ready = Promise::from_resolve_value(ctx, JSValue::UNDEFINED)?;
+        ready.perform_then(ctx, on_ok, on_ok)?;
     }
 
     Ok(instance.into())
+}
+
+/// Mark the default controller started (start() completed) and call `pull()`
+/// when the stream needs data. Shared by the synchronous and promise-returning
+/// start paths.
+fn mark_started_and_pull(cx: &mut ScopedContext, controller_val: JSValue) -> JSResult {
+    let cp = JSReadableStreamDefaultController::payload_of(&controller_val)
+        .ok_or_else(|| cx.throw_internal_error("invalid controller"))?;
+    cp.set_started(true);
+    if cp.should_call_pull(cx)? {
+        cp.call_pull(cx)?;
+    }
+    Ok(JSValue::UNDEFINED)
 }
 
 fn js_readable_stream_locked(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {

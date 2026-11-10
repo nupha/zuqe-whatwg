@@ -412,6 +412,39 @@ pub(crate) fn lookup_full(
     url: &str,
     req_headers: &[(String, String)],
 ) -> Option<CacheHit> {
+    lookup_full_at(method, url, req_headers, 0)
+}
+
+/// If the cached entry for `url` is a redirect, return its resolved Location so
+/// the caller can continue the lookup in the cache. The network path follows
+/// redirects before caching the final response, so a cache hit on the original
+/// URL must follow the same chain instead of surfacing a raw 3xx.
+fn cached_redirect(method: &str, url: &str, req_headers: &[(String, String)]) -> Option<String> {
+    if !method.eq_ignore_ascii_case("GET") {
+        return None;
+    }
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = cache.get(&(method.to_ascii_uppercase(), cache_key_url(url)))?;
+    let entry = select_variant(entries, req_headers)?;
+    if !(300..400).contains(&entry.status) {
+        return None;
+    }
+    let loc = header_value(&entry.headers, "location")?;
+    let base = url::Url::parse(&entry.final_url).ok()?;
+    base.join(&loc).ok().map(|u| u.to_string())
+}
+
+fn lookup_full_at(
+    method: &str,
+    url: &str,
+    req_headers: &[(String, String)],
+    depth: usize,
+) -> Option<CacheHit> {
+    if depth < 20
+        && let Some(target) = cached_redirect(method, url, req_headers)
+    {
+        return lookup_full_at(method, &target, req_headers, depth + 1);
+    }
     if !method.eq_ignore_ascii_case("GET") {
         return None;
     }

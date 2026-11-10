@@ -39,7 +39,6 @@ pub(crate) struct ReaderPayload {
 }
 
 impl ReaderPayload {
-
     /// Release the lock on the underlying stream: detach the reader so the
     /// stream can be acquired again, and reject `closed` plus any pending read
     /// requests with a TypeError (spec `ReadableStreamReaderGenericRelease` /
@@ -78,12 +77,28 @@ impl ReaderPayload {
         if let Some(mut rs) = self.stream.take()
             && let Some(sp) = rs.payload_mut()
         {
+            // Spec `ReadableStreamReaderGenericRelease`: reject the released
+            // reader's pending read requests with a TypeError.
+            if let Some(c) = sp.controller.get()
+                && let Ok(cp) = super::readable_controller::get_readable_controller(ctx, &c)
+            {
+                let reads = {
+                    let mut slot = cp.pending_read().borrow_mut();
+                    std::mem::take(&mut *slot).into_vec()
+                };
+                if !reads.is_empty() {
+                    let err = ctx
+                        .create_error_object(ErrorKind::Type, "Reader released", false)
+                        .map(JSValue::from)
+                        .unwrap_or(JSValue::UNDEFINED);
+                    for mut p in reads {
+                        p.reject(ctx, err);
+                    }
+                }
+            }
             sp.reader.take();
             // spec ReleaseSteps for default controller is a no-op;
             // no pull trigger here.
-            // Note: spec does NOT reject pending read() promises on
-            // release — they remain pending and are eventually resolved
-            // when the stream closes or errors.
         }
     }
 
@@ -304,7 +319,11 @@ impl ReaderPayload {
             let (promise, _rr) = Promise::create(ctx)?;
             let owner = cp.owner_value().unwrap_or(JSValue::UNDEFINED);
             cp.pending_read().borrow_mut().push(ctx, owner, promise);
-            cp.call_pull(ctx)?;
+            // Spec `ReadableStreamDefaultReaderRead` ends with
+            // CallPullIfNeeded, which is a no-op until start() completes.
+            if cp.should_call_pull(ctx)? {
+                cp.call_pull(ctx)?;
+            }
 
             return Ok(promise);
         }
@@ -350,8 +369,6 @@ impl ReaderPayload {
     }
 }
 
-
-
 /// WHATWG `TransferArrayBuffer` + `Construct`: detach `view`'s ArrayBuffer and
 /// return a view of the same type over the fresh buffer, covering `bytes` bytes
 /// from `view`'s byte offset.
@@ -374,11 +391,7 @@ pub(crate) fn transfer_view(
     // elementSize = byteLength / length; 1 for Uint8Array and DataView.
     let byte_length = view.byte_length() as u32;
     let elements = view.length() as u32;
-    let element_size = if elements > 0 {
-        (byte_length / elements).max(1)
-    } else {
-        1
-    };
+    let element_size = byte_length.checked_div(elements).unwrap_or(1).max(1);
     let count = bytes / element_size;
     // `ArrayBuffer.prototype.transfer()` detaches the source and yields a fresh
     // ArrayBuffer carrying the same bytes (a move, so this stays O(1)).

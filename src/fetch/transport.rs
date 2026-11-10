@@ -879,7 +879,25 @@ pub(crate) async fn perform_request(
                     if cp <= 0xFF { Some(cp as u8) } else { None }
                 })
                 .collect();
-            let hv = unsafe { reqwest::header::HeaderValue::from_maybe_shared_unchecked(bytes) };
+            // `http`'s HeaderValue rejects several control bytes that the Fetch
+            // spec permits in header values (0x01-0x08, 0x0B, 0x0C, ...). The
+            // unchecked constructor sends them verbatim, but asserts in debug
+            // builds; prefer graceful failure there over corrupting the run.
+            let hv = match reqwest::header::HeaderValue::from_bytes(&bytes) {
+                Ok(hv) => hv,
+                Err(_) => {
+                    #[cfg(not(debug_assertions))]
+                    unsafe {
+                        reqwest::header::HeaderValue::from_maybe_shared_unchecked(bytes)
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        // Debug builds assert inside that constructor; drop the
+                        // header instead of corrupting the whole run.
+                        continue;
+                    }
+                }
+            };
             rb = rb.header(k, hv);
         }
 

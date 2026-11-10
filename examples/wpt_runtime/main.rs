@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
+
 //! Minimal JS runtime for zuqe-whatwg that can run WPT `*.any.js` testharness tests.
 //!
 //! Usage:
@@ -6,6 +8,7 @@
 //!   wpt_runtime <script.js>
 
 use std::{
+    collections::HashSet,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -47,6 +50,14 @@ struct Args {
     testharness: Option<PathBuf>,
     #[arg(long, default_value_t = 10000u64)]
     timeout_ms: u64,
+    /// Base URL of the running wpt server, used to give each test its served
+    /// document URL (relative fetch()/location resolve against it).
+    #[arg(
+        long,
+        env = "WPT_SERVER_URL",
+        default_value = "http://web-platform.test:8000"
+    )]
+    server: String,
     /// Enable GC stress (debug + gc_generations builds) to catch young/old GC issues.
     #[arg(long, default_value_t = false)]
     gc_stress: bool,
@@ -95,6 +106,126 @@ fn collect_tests(inputs: &[PathBuf], root: Option<&Path>) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// The URL a browser would load the test file from: the local path mapped
+/// under the running wpt server. `.https.`/`.h2.` tests live on the TLS
+/// server (port 8443 by default).
+fn test_document_url(file: &Path, root: Option<&Path>, server: &str) -> url::Url {
+    let rel = root
+        .and_then(|r| file.strip_prefix(r).ok())
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let rel = rel.trim_start_matches('/');
+    let base = url::Url::parse(server)
+        .unwrap_or_else(|_| url::Url::parse("http://web-platform.test:8000").unwrap());
+    let mut u = base.join(rel).unwrap_or(base);
+    if rel.contains(".h2.") {
+        // WPT's HTTP/2 server listens on the h2 port (9000 by default).
+        let _ = u.set_scheme("https");
+        let _ = u.set_port(Some(9000));
+    } else if rel.contains(".https.") {
+        let _ = u.set_scheme("https");
+        let _ = u.set_port(Some(8443));
+    }
+    u
+}
+
+fn escape_js_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// GET a served WPT file. Returns `None` on any failure so callers can fall
+/// back to the local checkout.
+async fn fetch_source(http: &reqwest::Client, url: &url::Url) -> Option<String> {
+    let resp = http.get(url.as_str()).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.text().await.ok()
+}
+
+/// Expose `location` plus the `__wptClientUrl`/`__wptClientOrigin` fallbacks
+/// that `fetch` uses for same-origin checks and the default referrer.
+fn location_setup_script(doc_url: &url::Url) -> String {
+    let href = escape_js_string(doc_url.as_str());
+    let origin = escape_js_string(&doc_url.origin().ascii_serialization());
+    let protocol = format!("{}:", doc_url.scheme());
+    let host = escape_js_string(doc_url.host_str().unwrap_or(""));
+    let port = doc_url.port().map(|p| p.to_string()).unwrap_or_default();
+    let pathname = escape_js_string(doc_url.path());
+    let search = doc_url
+        .query()
+        .map(|q| escape_js_string(&format!("?{q}")))
+        .unwrap_or_default();
+    format!(
+        r#"(function(){{
+  var G = globalThis;
+  G.location = {{
+    href: "{href}", origin: "{origin}", protocol: "{protocol}",
+    host: "{host}", hostname: "{host}", port: "{port}",
+    pathname: "{pathname}", search: "{search}", hash: "",
+    toString: function() {{ return this.href; }}
+  }};
+  G.__wptClientUrl = "{href}";
+  G.__wptClientOrigin = "{origin}";
+}})();
+"#
+    )
+}
+
+/// Parse the leading `// META: script=...` block of a `.any.js` file.
+fn parse_meta_scripts(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in code.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix("//") else {
+            break;
+        };
+        let rest = rest.trim_start();
+        let Some(meta) = rest.strip_prefix("META:") else {
+            break;
+        };
+        let meta = meta.trim_start();
+        if let Some(v) = meta.strip_prefix("script=") {
+            out.push(v.trim().to_string());
+        }
+    }
+    out
+}
+
+/// Resolve and recursively collect `META: script=` dependencies. Dependencies
+/// listed by a dependency are evaluated before it, matching browser script
+/// order. Missing files are reported instead of aborting the run.
+fn collect_meta_scripts(
+    file: &Path,
+    root: Option<&Path>,
+    seen: &mut HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+    missing: &mut Vec<String>,
+) {
+    let Ok(code) = std::fs::read_to_string(file) else {
+        return;
+    };
+    for rel in parse_meta_scripts(&code) {
+        let p = if let Some(stripped) = rel.strip_prefix('/') {
+            root.map(|r| r.join(stripped))
+                .unwrap_or_else(|| PathBuf::from(stripped))
+        } else {
+            file.parent().unwrap_or(Path::new(".")).join(&rel)
+        };
+        let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        if !p.is_file() {
+            missing.push(rel);
+            continue;
+        }
+        collect_meta_scripts(&p, root, seen, out, missing);
+        out.push(p);
+    }
 }
 
 fn setup_wpt_globals(cx: &mut ScopedContext) -> Result<(), i32> {
@@ -149,9 +280,24 @@ fn js_module_loader(
 }
 
 fn eval_script(cx: &mut ScopedContext, code: &str, name: &str) -> Result<(), String> {
+    eval_script_at(cx, code, name, None)
+}
+
+/// Evaluate a global script. When `base` is set the script's document/base URL
+/// is that URL, so relative `fetch()`/`URL` resolution matches a browser.
+fn eval_script_at(
+    cx: &mut ScopedContext,
+    code: &str,
+    name: &str,
+    base: Option<&url::Url>,
+) -> Result<(), String> {
+    let eval_name = match base {
+        Some(u) => EvalName::BaseUrl(u.clone()),
+        None => EvalName::Name(name.to_string()),
+    };
     match cx.eval(
         code.as_bytes(),
-        &EvalName::Name(name.to_string()),
+        &eval_name,
         EvalType::Global,
         EvalFlags::empty(),
     ) {
@@ -201,15 +347,53 @@ fn get_global_bool(cx: &mut ScopedContext, name: &str) -> bool {
 
 async fn run_wpt_file(
     rt: &mut Runtime,
+    http: &reqwest::Client,
     testharness: &str,
     file: &Path,
+    root: Option<&Path>,
+    server: &str,
     timeout: Duration,
     gc_stress: bool,
 ) -> (u32, u32, Vec<String>) {
-    let code = match std::fs::read_to_string(file) {
-        Ok(c) => c,
-        Err(e) => return (0, 1, vec![format!("read {}: {e}", file.display())]),
+    let doc_url = test_document_url(file, root, server);
+    // Prefer the server's copy: wptserve performs `.sub.` substitutions
+    // (`{{host}}`, `{{ports[http][0]}}`, ...) that the on-disk file keeps raw.
+    // Fall back to disk when the server is unreachable.
+    let code = match fetch_source(http, &doc_url).await {
+        Some(c) => c,
+        None => match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => return (0, 1, vec![format!("read {}: {e}", file.display())]),
+        },
     };
+    let mut meta_scripts = Vec::new();
+    let mut missing_meta = Vec::new();
+    collect_meta_scripts(
+        file,
+        root,
+        &mut HashSet::new(),
+        &mut meta_scripts,
+        &mut missing_meta,
+    );
+    for m in &missing_meta {
+        println!("# missing META script {m} for {}", file.display());
+    }
+    // Fetch dependency sources up front: the scope closure below is sync.
+    let mut dep_sources: Vec<(String, String)> = Vec::new();
+    for dep in &meta_scripts {
+        let dep_url = test_document_url(dep, root, server);
+        let dep_code = match fetch_source(http, &dep_url).await {
+            Some(c) => c,
+            None => match std::fs::read_to_string(dep) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("# cannot read META script {}: {e}", dep.display());
+                    continue;
+                }
+            },
+        };
+        dep_sources.push((dep.display().to_string(), dep_code));
+    }
 
     let setup = r#"
 var G = (typeof globalThis !== 'undefined') ? globalThis : self;
@@ -291,7 +475,21 @@ Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
         eval_script(&mut cx, testharness, "<testharness>")
             .map_err(|e| format!("testharness: {e}"))?;
         eval_script(&mut cx, hook2, "<wpt-hook2>").map_err(|e| format!("hook2: {e}"))?;
-        eval_script(&mut cx, &format!("{code}\n"), &file_name).map_err(|e| format!("test: {e}"))?;
+        eval_script(&mut cx, &location_setup_script(&doc_url), "<wpt-location>")
+            .map_err(|e| format!("location: {e}"))?;
+        // The WPT TLS fixtures use a self-signed certificate.
+        eval_script(
+            &mut cx,
+            "try { fetch.allowInsecureTLS = true; } catch (e) {}",
+            "<wpt-fetch-config>",
+        )
+        .map_err(|e| format!("fetch config: {e}"))?;
+        for (label, dep_code) in &dep_sources {
+            eval_script_at(&mut cx, dep_code, label, Some(&doc_url))
+                .map_err(|e| format!("meta {label}: {e}"))?;
+        }
+        eval_script_at(&mut cx, &format!("{code}\n"), &file_name, Some(&doc_url))
+            .map_err(|e| format!("test: {e}"))?;
         eval_script(&mut cx, finish, "<wpt-finish>").map_err(|e| format!("finish: {e}"))?;
         Ok(())
     });
@@ -435,10 +633,37 @@ async fn run_script_file(rt: &mut Runtime, file: &Path, gc_stress: bool) -> Exit
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args = Args::parse();
 
+    // WPT's testharness and the engine's native call trampolines consume a lot
+    // of native stack; the default Windows main-thread stack (1 MiB) makes the
+    // engine's C-stack guard fire inside otherwise-shallow assertions. Run the
+    // whole workload on a dedicated thread with plenty of stack.
+    match std::thread::Builder::new()
+        .name("wpt-runtime".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => rt.block_on(run(args)),
+                Err(e) => {
+                    eprintln!("wpt_runtime: failed to create tokio runtime: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }) {
+        Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
+        Err(e) => {
+            eprintln!("wpt_runtime: failed to spawn thread: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: Args) -> ExitCode {
     zuqe_whatwg::install_state_accessor(whatwg_state);
     let mut rt = match Runtime::create_with(WptState {
         whatwg: zuqe_whatwg::WhatwgState::new(),
@@ -492,12 +717,21 @@ async fn main() -> ExitCode {
     let mut total_fail = 0u32;
     let mut all_failures = Vec::new();
     let timeout = Duration::from_millis(args.timeout_ms);
+    // WPT's TLS server uses a self-signed certificate; fetching test sources
+    // over https must not validate it.
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     for t in &tests {
         println!("# running {}", t.display());
         let run = AssertUnwindSafe(run_wpt_file(
             &mut rt,
+            &http,
             &testharness,
             t,
+            args.root.as_deref(),
+            &args.server,
             timeout,
             args.gc_stress,
         ))

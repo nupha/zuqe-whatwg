@@ -6,7 +6,7 @@ use std::{cell::RefCell, rc::Rc};
 use zuqe::{
     Array, Atom, CallContext, ClassCtorDef, FieldDef, JS_CLASS_ITERATOR, JS_PROP_C_W_E,
     JSIteratorKindEnum, JSResult, JSValue, Object, ScopedContext, def_native_object,
-    gc_lite::{GcTrace, GcTraceCtx},
+    gc_lite::GcTrace,
 };
 
 /// Case-insensitive header storage. Names keep their original casing; lookups
@@ -24,11 +24,18 @@ use zuqe::{
 #[derive(Clone, Default)]
 pub(crate) struct HeaderList {
     list: Vec<(String, String)>,
+    /// Original casing of the first `append`/`set` for each lowercased name.
+    /// The Fetch spec stores lowercase names, but browsers send the casing the
+    /// author used on the wire (WPT `request-headers-case`).
+    wire_names: std::collections::HashMap<String, String>,
 }
 
 impl HeaderList {
     pub(crate) fn new() -> Self {
-        HeaderList { list: Vec::new() }
+        HeaderList {
+            list: Vec::new(),
+            wire_names: std::collections::HashMap::new(),
+        }
     }
 
     pub(crate) fn from_vec(v: Vec<(String, String)>) -> Self {
@@ -66,6 +73,9 @@ impl HeaderList {
     pub(crate) fn append(&mut self, name: &str, value: &str) {
         // Header names are normalized to lowercase on storage (Fetch spec).
         let key = name.to_lowercase();
+        self.wire_names
+            .entry(key.clone())
+            .or_insert_with(|| name.to_string());
         let value = normalize_header_value(value).to_string();
         if let Some(pos) = self.list.iter().position(|(k, _)| *k == key) {
             if key == "set-cookie" {
@@ -88,6 +98,7 @@ impl HeaderList {
     pub(crate) fn set(&mut self, name: &str, value: &str) {
         let key = name.to_lowercase();
         let lower = key.clone();
+        self.wire_names.insert(key.clone(), name.to_string());
         let value = normalize_header_value(value).to_string();
         self.list.retain(|(k, _)| *k != lower);
         let idx = self.sorted_insert_index(&key);
@@ -96,7 +107,14 @@ impl HeaderList {
 
     pub(crate) fn delete(&mut self, name: &str) {
         let lower = name.to_lowercase();
+        self.wire_names.remove(&lower);
         self.list.retain(|(k, _)| k.to_lowercase() != lower);
+    }
+
+    /// Original casing for a stored (lowercased) header name, if one was
+    /// recorded. Used only when serializing onto the wire.
+    pub(crate) fn wire_name(&self, lower: &str) -> Option<&String> {
+        self.wire_names.get(lower)
     }
 
     /// Filter entries per the Fetch spec's request-header guard:

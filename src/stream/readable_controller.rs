@@ -758,6 +758,19 @@ impl ReadableControllerPayload {
         if !readable {
             return Ok(false);
         }
+        // Spec `ReadableStreamDefaultControllerShouldCallPull`: pull() must not
+        // run until start() has completed.
+        if let ReadableControllerKind::Default { started, .. } = &self.kind
+            && !started.get()
+        {
+            return Ok(false);
+        }
+        // A pending read request also forces a pull (spec
+        // `ReadableStreamDefaultControllerShouldCallPull` step 5), which keeps
+        // hwm-0 transform/readable streams flowing.
+        if !self.pending_read().borrow().is_empty() {
+            return Ok(true);
+        }
         if !self.queue().borrow().is_empty() {
             return Ok(false);
         }
@@ -769,16 +782,12 @@ impl ReadableControllerPayload {
         match &self.kind {
             ReadableControllerKind::Default {
                 pulling,
-                started,
                 pull_again,
                 controller,
                 ..
             } => {
-                // Spec: pull() never runs before start() completes. aike approximates
-                // this by treating `started` as set once pulling begins.
-                if !started.get() {
-                    started.set(true);
-                }
+                // Spec: pull() never runs before start() completes. `started`
+                // is set by the constructor's start-completion path.
                 if pulling.get() {
                     pull_again.set(true);
                     return Ok(());
@@ -1266,13 +1275,14 @@ impl ReadableControllerPayload {
     }
 
     /// Close the controlled stream. Per WHATWG
-    /// `ReadableStreamDefaultControllerClose` step 1, if CanCloseOrEnqueue is
-    /// false (stream not readable or close already requested), silently set
-    /// `closeRequested` and return — no throw.
+    /// `ReadableStreamDefaultControllerClose` / `ReadableByteStreamControllerClose`
+    /// step 1, throws a TypeError when `CanCloseOrEnqueue` is false (stream not
+    /// readable or close already requested).
     pub(crate) fn close(&self, ctx: &mut ScopedContext) -> Result<(), i32> {
         if !self.can_close_or_enqueue() {
-            self.close_requested.set(true);
-            return Ok(());
+            return Err(ctx.throw_type_error(
+                "Cannot close a ReadableStreamController whose stream is not readable",
+            ));
         }
 
         match &self.kind {

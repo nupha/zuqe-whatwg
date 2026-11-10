@@ -139,11 +139,9 @@ fn run_pipe_driver(
     // has been fully read (so the destination is closed once writes drain).
     state.set_property_str(ctx, "pendingWrites", 0.into())?;
     state.set_property_str(ctx, "readDone", false.into())?;
-    // The spec's first `reader.read()` is issued unconditionally during setup,
-    // before any backpressure check — so the source is disturbed synchronously
-    // even when the destination's desiredSize is not positive (WPT
-    // `response-stream-disturbed-by-pipe` reads with `highWaterMark: 0`).
-    state.set_property_str(ctx, "issuedFirstRead", false.into())?;
+    // Set when a signal abort must wait for already-read chunks to be written
+    // before aborting the destination (spec "shutdown with an action").
+    state.set_property_str(ctx, "abortPending", false.into())?;
 
     // Uniform data layout threaded through every async pipe callback:
     //   [0] state, [1] resolve, [2] reject, [3] reader, [4] writer,
@@ -159,10 +157,33 @@ fn run_pipe_driver(
         options,
     ];
 
+    // Spec step: piping disturbs the source synchronously. Set it before any
+    // backpressure check so `bodyUsed` is true even when the destination does
+    // not desire chunks (WPT `response-stream-disturbed-by-pipe`).
+    if let Some(rp) = JSReadableStreamDefaultReader::payload_of(&data[3])
+        && let Some(mut rs) = rp.stream
+        && let Some(sp) = rs.payload_mut()
+    {
+        sp.disturbed = true;
+    }
+
     // Synchronous abort check: a signal already aborted must reject the pipe
-    // promise without doing any reads.
+    // promise without doing any reads. Run the abort in a microtask so the
+    // destination's start promise reaction (which marks it started) runs
+    // first: the sink's `abort()` then fires synchronously, preserving the
+    // spec's abort-then-cancel order (WPT `piping/abort.any.js`).
     if signal.is_some() && signal_is_aborted(&signal_val) {
-        pipe_to_perform_abort(ctx, &data)?;
+        let on_abort = ctx
+            .create_native_function_with_data(
+                Callback::Func(pipe_to_abort_now),
+                "pipeToOnAbortMicrotask",
+                1,
+                0,
+                data.into(),
+            )?
+            .into();
+        let mut ready = Promise::from_resolve_value(ctx, JSValue::UNDEFINED)?;
+        ready.perform_then(ctx, on_abort, on_abort)?;
         return Ok(JSValue::from(promise));
     }
 
@@ -194,20 +215,21 @@ fn run_pipe_driver(
         }
     }
 
-    // Already-errored source *and* a still-writable destination: shut the pipe
-    // down synchronously (before any read microtask). This honors the spec rule
-    // that a destination `close()` requested before `start()` finished is
-    // superseded by the abort the errored source triggers: the destination's
-    // `close_requested` is cleared here, so its start-completion close never
-    // runs. A non-writable destination is left to the normal path (which must
-    // not reject a closed→closed pipe), so the synchronous check is gated on
-    // `dest_writable`.
-    if pipe_dest_is_writable(&data[4])
-        && let Some(err) = pipe_source_errored(&data[3])
-    {
-        set_state_bool(ctx, &data[0], "shuttingDown", true)?;
-        pipe_shutdown_with_error(ctx, &data, err)?;
-        return Ok(JSValue::from(promise));
+    // Errors propagate forward: an already-errored source rejects the pipe
+    // synchronously (before any read). A destination that is already errored
+    // or closed makes the abort action a no-op, so the source's error wins.
+    // An "erroring" destination instead rejects with its own stored error (the
+    // pending abort action), so leave that to the abort/read path.
+    if let Some(err) = pipe_source_errored(&data[3]) {
+        let dest_state = pipe_dest_state(&data[4]);
+        if matches!(
+            dest_state,
+            Some(RsState::Readable | RsState::Errored | RsState::Closed)
+        ) {
+            set_state_bool(ctx, &data[0], "shuttingDown", true)?;
+            pipe_shutdown_with_error(ctx, &data, err)?;
+            return Ok(JSValue::from(promise));
+        }
     }
 
     // Keep watching the destination's `closed` promise: an errored destination
@@ -278,20 +300,13 @@ fn pipe_to_read(ctx: &mut ScopedContext, data: &[JSValue]) -> JSResult {
     if pipe_is_shutting_down(ctx, &data[0])? {
         return Ok(JSValue::UNDEFINED);
     }
-    let mut state_obj = data[0].as_object().unwrap();
+    let state_obj = data[0].as_object().unwrap();
     if state_obj.get_property_str(ctx, "readDone")?.to_bool()? {
         return Ok(JSValue::UNDEFINED);
     }
-    // The first read is unconditional (see `issuedFirstRead`); afterwards apply
-    // backpressure — do not read while the destination does not desire chunks.
-    // The destination's queue may hold writes from this pipe, so desiredSize
-    // is writable hwm minus the writes this pipe still has in flight.
-    let first_read = !state_obj
-        .get_property_str(ctx, "issuedFirstRead")?
-        .to_bool()?;
-    if first_read {
-        state_obj.set_property_str(ctx, "issuedFirstRead", true.into())?;
-    } else if !pipe_wants_read(ctx, data)? {
+    // Apply backpressure: do not read while the destination does not desire
+    // chunks (its desiredSize already accounts for writes queued by this pipe).
+    if !pipe_wants_read(ctx, data)? {
         return Ok(JSValue::UNDEFINED);
     }
     let reader = data[3];
@@ -321,17 +336,11 @@ fn pipe_to_read(ctx: &mut ScopedContext, data: &[JSValue]) -> JSResult {
     Ok(JSValue::UNDEFINED)
 }
 
-// True if the destination currently desires another chunk: its highWaterMark
-// minus the writes this pipe has in flight is positive. An errored destination
-// reports `null` desiredSize but the pipe still performs one read first (aike
-// has no creation-time pull, so the read is what surfaces the source's pull);
-// the errored destination then rejects the write and shuts the pipe down.
+// True if the destination currently desires another chunk. `desiredSize`
+// already subtracts queued writes (including this pipe's), so no extra
+// in-flight adjustment is needed. A null desiredSize (errored destination)
+// still allows one read so the error surfaces through the write path.
 fn pipe_wants_read(ctx: &mut ScopedContext, data: &[JSValue]) -> Result<bool, i32> {
-    let state_obj = data[0].as_object().unwrap();
-    let pending = state_obj
-        .get_property_str(ctx, "pendingWrites")?
-        .to_number(ctx)?
-        .to_f64() as i32;
     let writer = data[4];
     let ds = writer.get_property_str(ctx, "desiredSize")?;
     if ds.is_null() {
@@ -340,8 +349,7 @@ fn pipe_wants_read(ctx: &mut ScopedContext, data: &[JSValue]) -> Result<bool, i3
     if ds.is_undefined() {
         return Ok(false);
     }
-    let desired = ds.to_number(ctx)?.to_f64() - pending as f64;
-    Ok(desired > 0.0)
+    Ok(ds.to_number(ctx)?.to_f64() > 0.0)
 }
 
 fn pipe_source_errored(reader: &JSValue) -> Option<JSValue> {
@@ -404,6 +412,16 @@ fn pipe_close_dest(ctx: &mut ScopedContext, data: &[JSValue]) -> JSResult {
     let prevent_close = pipe_option_bool(ctx, &data[6], "preventClose")?;
     let writer = data[4];
     if prevent_close {
+        return pipe_resolve(ctx, data);
+    }
+    // The destination may already have a close queued/in flight (e.g. the
+    // caller closed it before piping). `writer.close()` would reject with a
+    // TypeError; a closed→closed pipe must fulfill instead.
+    if let Some(wp) = JSWritableStreamDefaultWriter::payload_of(&writer)
+        && let Some(stream) = wp.stream
+        && let Some(sp) = stream.payload()
+        && (sp.state == RsState::Closed || sp.close_requested || sp.in_flight_close)
+    {
         return pipe_resolve(ctx, data);
     }
     // Close the destination; resolve the pipe promise when done. A close
@@ -486,6 +504,18 @@ fn pipe_to_on_abort(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         return pipe_shutdown_with_error(ctx, &data, err).map(|_| JSValue::UNDEFINED);
     }
     set_state_bool(ctx, &data[0], "shuttingDown", true)?;
+    // Wait for already-read chunks to finish writing before aborting the
+    // destination, if it is still writable.
+    let pending = data[0]
+        .as_object()
+        .unwrap()
+        .get_property_str(ctx, "pendingWrites")?
+        .to_number(ctx)?
+        .to_f64() as i32;
+    if pending > 0 && pipe_dest_is_writable(&data[4]) {
+        set_state_bool(ctx, &data[0], "abortPending", true)?;
+        return Ok(JSValue::UNDEFINED);
+    }
     pipe_to_perform_abort(ctx, &data).map(|_| JSValue::UNDEFINED)
 }
 
@@ -495,6 +525,46 @@ fn set_state_bool(ctx: &mut ScopedContext, state: &JSValue, key: &str, v: bool) 
         .unwrap()
         .set_property_str(ctx, key, v.into())?;
     Ok(())
+}
+
+// Abort path for a signal that was already aborted when `pipeTo` was called.
+// The abort reason takes priority over any source/destination error state, so
+// this skips `pipe_to_on_abort`'s errored-end checks.
+fn pipe_to_abort_now(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
+    let data = [
+        cc.data(0),
+        cc.data(1),
+        cc.data(2),
+        cc.data(3),
+        cc.data(4),
+        cc.data(5),
+        cc.data(6),
+    ];
+    if pipe_is_shutting_down(ctx, &data[0])? {
+        return Ok(JSValue::UNDEFINED);
+    }
+    set_state_bool(ctx, &data[0], "shuttingDown", true)?;
+    pipe_to_perform_abort(ctx, &data).map(|_| JSValue::UNDEFINED)
+}
+
+// While an abort is pending, wait until every already-read chunk has been
+// written before running the abort/cancel actions (spec "shutdown with an
+// action" step 3). Returns true when the caller must stop its normal loop.
+fn pipe_abort_pending(ctx: &mut ScopedContext, data: &[JSValue]) -> Result<bool, i32> {
+    let state_obj = data[0].as_object().unwrap();
+    if !state_obj.get_property_str(ctx, "abortPending")?.to_bool()? {
+        return Ok(false);
+    }
+    let pending = state_obj
+        .get_property_str(ctx, "pendingWrites")?
+        .to_number(ctx)?
+        .to_f64() as i32;
+    if pending > 0 {
+        return Ok(true);
+    }
+    set_state_bool(ctx, &data[0], "abortPending", false)?;
+    pipe_to_perform_abort(ctx, data)?;
+    Ok(true)
 }
 
 // Read the abort reason off the signal (or undefined if no signal).
@@ -519,6 +589,7 @@ fn pipe_signal_reason(_ctx: &mut ScopedContext, signal: &JSValue) -> JSValue {
 // with (WPT: "all the error objects should be the same object").
 fn pipe_to_perform_abort(ctx: &mut ScopedContext, data: &[JSValue]) -> Result<(), i32> {
     let state = data[0];
+    set_state_bool(ctx, &state, "abortPending", false)?;
     let reader = data[3];
     let options = data[6];
     let reason = pipe_signal_reason(ctx, &data[5]);
@@ -572,16 +643,14 @@ fn pipe_to_perform_abort(ctx: &mut ScopedContext, data: &[JSValue]) -> Result<()
 
 // True if the stream behind this pipe's writer is still writable.
 fn pipe_dest_is_writable(writer: &JSValue) -> bool {
-    let Some(wp) = JSWritableStreamDefaultWriter::payload_of(writer) else {
-        return false;
-    };
-    let Some(stream) = wp.stream else {
-        return false;
-    };
-    let Some(sp) = stream.payload() else {
-        return false;
-    };
-    sp.state == RsState::Readable
+    pipe_dest_state(writer) == Some(RsState::Readable)
+}
+
+// Current state of the writable stream behind this pipe's writer.
+fn pipe_dest_state(writer: &JSValue) -> Option<RsState> {
+    let wp = JSWritableStreamDefaultWriter::payload_of(writer)?;
+    let stream = wp.stream?;
+    stream.payload().map(|sp| sp.state)
 }
 
 fn set_state_num(ctx: &mut ScopedContext, state: &JSValue, key: &str, n: u32) -> Result<(), i32> {
@@ -772,9 +841,11 @@ pub(super) fn js_readable_stream_pipe_through(
     if !options.is_undefined_or_null()
         && let Some(obj) = options.as_object()
     {
-        prevent_close = obj.get_property_str(ctx, "preventClose")?.to_bool()?;
+        // Options are read in the order required by WPT (and browsers):
+        // preventAbort, preventCancel, preventClose, signal.
         prevent_abort = obj.get_property_str(ctx, "preventAbort")?.to_bool()?;
         prevent_cancel = obj.get_property_str(ctx, "preventCancel")?.to_bool()?;
+        prevent_close = obj.get_property_str(ctx, "preventClose")?.to_bool()?;
         signal = obj.get_property_str(ctx, "signal")?;
     }
     if !signal.is_undefined() && JSAbortSignal::payload_of(&signal).is_none() {
@@ -898,6 +969,8 @@ fn pipe_to_on_write_done(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     ];
     pipe_bump_state_num(ctx, &data[0], "pendingWrites", -1)?;
     if pipe_is_shutting_down(ctx, &data[0])? {
+        // A signal abort may have been waiting for this write.
+        pipe_abort_pending(ctx, &data)?;
         return Ok(JSValue::UNDEFINED);
     }
     let state_obj = data[0].as_object().unwrap();
@@ -935,10 +1008,29 @@ fn pipe_to_on_read_error(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     pipe_shutdown_with_error(ctx, &data, reason).map(|_| JSValue::UNDEFINED)
 }
 
-// Destination `closed` fulfilled: normal pipe completion already resolves via
-// the read loop; nothing to do here.
-fn pipe_to_on_dest_closed_ok(_ctx: &mut ScopedContext, _cc: CallContext) -> JSResult {
-    Ok(JSValue::UNDEFINED)
+// Destination `closed` fulfilled: closing must propagate backward unless the
+// source has already finished (closed/errored), in which case the pipe simply
+// completes. An open source rejects with a TypeError and is canceled.
+fn pipe_to_on_dest_closed_ok(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
+    let data = [
+        cc.data(0),
+        cc.data(1),
+        cc.data(2),
+        cc.data(3),
+        cc.data(4),
+        cc.data(5),
+        cc.data(6),
+    ];
+    if pipe_is_shutting_down(ctx, &data[0])? {
+        return Ok(JSValue::UNDEFINED);
+    }
+    if pipe_source_is_final(&data[3]) {
+        return pipe_resolve(ctx, &data);
+    }
+    set_state_bool(ctx, &data[0], "shuttingDown", true)?;
+    let _ = ctx.throw_type_error("destination is closed");
+    let err = ctx.take_exception().to_value(ctx);
+    pipe_shutdown_with_error(ctx, &data, err).map(|_| JSValue::UNDEFINED)
 }
 
 // Destination errored while the source read is still pending: shut the pipe
@@ -954,8 +1046,20 @@ fn pipe_to_on_dest_closed_err(ctx: &mut ScopedContext, cc: CallContext) -> JSRes
         cc.data(5),
         cc.data(6),
     ];
+    // A signal abort may be waiting for pending writes; keep waiting. The
+    // destination's rejection here is a consequence of that abort.
+    if pipe_abort_pending(ctx, &data)? {
+        return Ok(JSValue::UNDEFINED);
+    }
     if pipe_is_shutting_down(ctx, &data[0])? {
         return Ok(JSValue::UNDEFINED);
+    }
+    // With preventAbort, the readable's already-recorded error is the pipe
+    // rejection even when the destination is in the middle of erroring.
+    let prevent_abort = pipe_option_bool(ctx, &data[6], "preventAbort")?;
+    if prevent_abort && let Some(err) = pipe_source_errored(&data[3]) {
+        set_state_bool(ctx, &data[0], "shuttingDown", true)?;
+        return pipe_shutdown_with_error(ctx, &data, err).map(|_| JSValue::UNDEFINED);
     }
     set_state_bool(ctx, &data[0], "shuttingDown", true)?;
     let reason = cc.arg(0);
@@ -973,7 +1077,12 @@ fn pipe_to_on_write_error(ctx: &mut ScopedContext, cc: CallContext) -> JSResult 
         cc.data(5),
         cc.data(6),
     ];
+    // A rejected write during a signal abort counts as settled; once the
+    // remaining writes drain, perform the abort (the abort reason, not the
+    // write error, is the pipe's rejection in that case).
     if pipe_is_shutting_down(ctx, &data[0])? {
+        pipe_bump_state_num(ctx, &data[0], "pendingWrites", -1)?;
+        pipe_abort_pending(ctx, &data)?;
         return Ok(JSValue::UNDEFINED);
     }
     set_state_bool(ctx, &data[0], "shuttingDown", true)?;

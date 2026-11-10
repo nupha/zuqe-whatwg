@@ -11,6 +11,7 @@ use zuqe::{
 
 use crate::fetch::{
     body::{BODY_TIMEOUT, body_content_type, body_to_bytes},
+    config::{HttpClientConfig, ProtocolMode},
     headers::{HeaderList, JSHeaders, header_list_from_js, validate_header_list_for_fetch},
     request::{
         JSRequest, get_request_payload_mut, normalize_method, validate_request_init_options,
@@ -798,16 +799,19 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 
     // Runtime TLS escape: `insecure` (from `fetch.allowInsecureTLS`) skips cert
     // validation for this request's client.
-    let mut cfg = crate::fetch::config::HttpClientConfig::default();
-    cfg.protocol = crate::fetch::config::ProtocolMode::Http1Only;
-    // WHATWG `fetch` manages cookies itself via the shared global jar (driven
-    // by the `credentials` mode), so disable reqwest's automatic store which
-    // would otherwise send cookies unconditionally.
-    cfg.cookie_jar = false;
-    // Disable reqwest's auto-follow in all redirect modes: `follow` is handled
-    // manually here (per-hop referrer/origin recomputation); `manual`/`error`
-    // must surface the first 3xx response rather than following it.
-    cfg.follow_redirects = false;
+    let cfg = HttpClientConfig {
+        protocol: ProtocolMode::Http1Only,
+        // WHATWG `fetch` manages cookies itself via the shared global jar
+        // (driven by the `credentials` mode), so disable reqwest's automatic
+        // store which would otherwise send cookies unconditionally.
+        cookie_jar: false,
+        // Disable reqwest's auto-follow in all redirect modes: `follow` is
+        // handled manually here (per-hop referrer/origin recomputation);
+        // `manual`/`error` must surface the first 3xx response rather than
+        // following it.
+        follow_redirects: false,
+        ..Default::default()
+    };
 
     // Build the client *before* the result-slot promise below: a client-build
     // failure must reject (via the caller) without leaving the polling job
@@ -1176,6 +1180,15 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         credentials_include,
         user_agent,
     });
+
+    // Send author-supplied header names with the casing they were first given
+    // (browsers preserve it on the wire; WPT `request-headers-case`), while the
+    // `Headers` object itself stays lowercased per the Fetch spec.
+    for (name, _) in &mut req_headers {
+        if let Some(orig) = header_list.wire_name(name) {
+            *name = orig.clone();
+        }
+    }
 
     let req = TransportRequest {
         method,
