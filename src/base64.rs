@@ -212,7 +212,7 @@ fn js_hex_to_bytes(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 
 /// Install the encoding globals: `btoa`, `atob`, `bytesToBase64`,
 /// `base64ToBytes`, `bytesToHex`, `hexToBytes`.
-pub(crate) fn init_encoding(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
+pub fn init_encoding(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
     let btoa = ctx.create_native_function(Callback::Func(js_btoa), "btoa", 1, 0)?;
     global.define_property_value_str(ctx, "btoa", btoa.into(), zuqe::JS_PROP_C_W_E)?;
     let atob = ctx.create_native_function(Callback::Func(js_atob), "atob", 1, 0)?;

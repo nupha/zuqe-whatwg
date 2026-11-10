@@ -696,12 +696,17 @@ impl GcTrace for AbortControllerPayload {
 }
 
 /// Get the abort `Notify` for a JS `AbortSignal` value, if it is one.
-pub(crate) fn signal_notify(val: &JSValue) -> Option<Arc<Notify>> {
+pub fn signal_notify(val: &JSValue) -> Option<Arc<Notify>> {
     JSAbortSignal::payload_of(val).map(|p| p.notify())
 }
 
+/// Whether a value is a genuine `AbortSignal` instance.
+pub fn is_abort_signal(val: &JSValue) -> bool {
+    JSAbortSignal::payload_of(val).is_some()
+}
+
 /// Whether a JS `AbortSignal` value is already aborted.
-pub(crate) fn signal_is_aborted(val: &JSValue) -> bool {
+pub fn signal_is_aborted(val: &JSValue) -> bool {
     JSAbortSignal::payload_of(val)
         .map(|p| p.is_aborted())
         .unwrap_or(false)
@@ -712,7 +717,7 @@ pub(crate) fn signal_is_aborted(val: &JSValue) -> bool {
 /// Per the Fetch spec, a fetch cancelled by a signal must reject with the
 /// signal's `reason` (e.g. a DOMException "AbortError" or whatever was passed
 /// to `abort()`), not a freshly-constructed error.
-pub(crate) fn signal_reason(val: &JSValue) -> Option<JSValue> {
+pub fn signal_reason(val: &JSValue) -> Option<JSValue> {
     let p = JSAbortSignal::payload_of(val)?;
     if p.is_aborted() {
         Some(p.inner.borrow().reason.get())
@@ -786,10 +791,7 @@ pub(crate) fn make_default_signal(ctx: &mut ScopedContext) -> JSResult {
     new_signal(ctx, inner)
 }
 
-pub(crate) fn init_abort_signal_statics(
-    ctx: &mut ScopedContext,
-    global: &mut Object,
-) -> Result<(), i32> {
+pub fn init_abort_signal_statics(ctx: &mut ScopedContext, global: &mut Object) -> Result<(), i32> {
     // Register AbortSignal.abort() static method
     let abort_fn =
         ctx.create_native_function(zuqe::Callback::Func(js_signal_static_abort), "abort", 1, 0)?;

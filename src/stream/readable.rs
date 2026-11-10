@@ -21,10 +21,10 @@ use zuqe::{
 };
 
 use crate::{
-    aike::AikeRuntimeState,
     abort::{signal_is_aborted, signal_reason},
     dom::make_dom_exception,
     fetch::body::BodySource,
+    state::WhatwgState,
     stream::{
         extract_high_water_mark,
         reader::{JSReadableStreamDefaultReader, ReaderPayload},
@@ -982,7 +982,7 @@ pub(crate) struct ChannelStream {
     pub(crate) idle_deadline: Instant,
 }
 
-/// Per-runtime channel-backed streams, stored on `AikeRuntimeState`.
+/// Per-runtime channel-backed streams, stored on `WhatwgState`.
 #[derive(Default, GcTrace)]
 #[gc(crate_path = zuqe::gc_lite)]
 pub(crate) struct ChannelStreamState {
@@ -1381,7 +1381,7 @@ impl JSReadableStream {
         sp.signal.set(ctx, owner, signal);
 
         let start_poller = {
-            let st = AikeRuntimeState::of(ctx);
+            let st = WhatwgState::of(ctx);
             let id = st.channel_streams.next_id;
             st.channel_streams.next_id = id + 1;
             st.channel_streams.streams.insert(
@@ -1595,7 +1595,7 @@ fn pump_channel_stream(cx: &mut ScopedContext, id: u64) -> Result<bool, i32> {
     // Resolve abort signal from the GC-traced stream payload
     // (controller -> stream -> signal). Never read a dangling
     // handle: only visit entries that still map to a live stream.
-    let resolved = AikeRuntimeState::of(cx)
+    let resolved = WhatwgState::of(cx)
         .channel_streams
         .streams
         .get(&id)
@@ -1629,7 +1629,7 @@ fn pump_channel_stream(cx: &mut ScopedContext, id: u64) -> Result<bool, i32> {
 
     // Receive from the channel, releasing the state borrow before
     // any JS call below.
-    let recv = AikeRuntimeState::of(cx)
+    let recv = WhatwgState::of(cx)
         .channel_streams
         .streams
         .get(&id)
@@ -1637,11 +1637,7 @@ fn pump_channel_stream(cx: &mut ScopedContext, id: u64) -> Result<bool, i32> {
     match recv {
         Some(Ok(Ok(data))) => {
             // Producer alive: refresh deadline, then enqueue.
-            if let Some(s) = AikeRuntimeState::of(cx)
-                .channel_streams
-                .streams
-                .get_mut(&id)
-            {
+            if let Some(s) = WhatwgState::of(cx).channel_streams.streams.get_mut(&id) {
                 s.idle_deadline = Instant::now();
             }
             let ta = TypedArray::create_from_vec_u8(cx, data)
@@ -1666,7 +1662,7 @@ fn pump_channel_stream(cx: &mut ScopedContext, id: u64) -> Result<bool, i32> {
             Ok(false)
         }
         Some(Err(TryRecvError::Empty)) => {
-            let expired = AikeRuntimeState::of(cx)
+            let expired = WhatwgState::of(cx)
                 .channel_streams
                 .streams
                 .get(&id)
@@ -1694,7 +1690,7 @@ fn start_channel_stream_poller(ctx: &mut ScopedContext) {
             // Snapshot ids first, then access one stream at a time so the state
             // borrow is never held across a JS call (which can trigger GC; the
             // engine traces the whole state).
-            let ids: Vec<u64> = AikeRuntimeState::of(cx)
+            let ids: Vec<u64> = WhatwgState::of(cx)
                 .channel_streams
                 .streams
                 .keys()
@@ -1725,16 +1721,16 @@ fn start_channel_stream_poller(ctx: &mut ScopedContext) {
             }
 
             if !to_remove.is_empty() {
-                let st = AikeRuntimeState::of(cx);
+                let st = WhatwgState::of(cx);
                 for id in &to_remove {
                     st.channel_streams.streams.remove(id);
                 }
             }
 
-            if AikeRuntimeState::of(cx).channel_streams.streams.is_empty() {
+            if WhatwgState::of(cx).channel_streams.streams.is_empty() {
                 // Nothing left to pump: let the next `from_channel` start a new
                 // pump by clearing the liveness flag.
-                AikeRuntimeState::of(cx).channel_streams.poller_running = false;
+                WhatwgState::of(cx).channel_streams.poller_running = false;
                 Ok(JobState::Done)
             } else {
                 Ok(JobState::Block)
@@ -1770,7 +1766,7 @@ fn js_readable_stream_byob_reader_static(ctx: &mut ScopedContext, cc: CallContex
 }
 
 /// Register the static `ReadableStream.from()` method on the global constructor.
-pub(crate) fn init_readable_stream_statics(
+pub fn init_readable_stream_statics(
     ctx: &mut ScopedContext,
     global: &mut Object,
 ) -> Result<(), i32> {

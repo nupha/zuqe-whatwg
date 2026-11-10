@@ -408,10 +408,7 @@ fn clone_container(
 }
 
 /// Install the global `structuredClone`.
-pub(crate) fn init_structured_clone(
-    ctx: &mut ScopedContext,
-    mut global: Object,
-) -> Result<(), i32> {
+pub fn init_structured_clone(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
     let f =
         ctx.create_native_function(Callback::Func(js_structured_clone), "structuredClone", 2, 0)?;
     global.define_property_value_str(ctx, "structuredClone", f.into(), zuqe::JS_PROP_C_W_E)?;

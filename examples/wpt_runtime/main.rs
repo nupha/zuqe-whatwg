@@ -17,8 +17,26 @@ use futures_util::FutureExt;
 use clap::Parser;
 use zuqe::{
     Callback, EvalFlags, EvalName, EvalType, Exception, ExitStatus, JSValue, ModuleDef, Runtime,
-    ScopedContext,
+    RuntimeUserState, ScopedContext,
+    gc_lite::{GcTrace, GcTraceCtx},
 };
+
+/// Host runtime state for the example: owns the WHATWG per-runtime state.
+struct WptState {
+    whatwg: zuqe_whatwg::WhatwgState,
+}
+
+impl GcTrace for WptState {
+    fn trace(&self, gcx: &mut GcTraceCtx) {
+        self.whatwg.trace(gcx);
+    }
+}
+
+impl RuntimeUserState for WptState {}
+
+fn whatwg_state<'a, 'c>(ctx: &'a mut ScopedContext<'c>) -> &'a mut zuqe_whatwg::WhatwgState {
+    &mut ctx.rt_mut().user_state_mut::<WptState>().whatwg
+}
 
 #[derive(Debug, Parser)]
 #[command(about = "Minimal zuqe-whatwg runtime / WPT runner")]
@@ -421,7 +439,10 @@ async fn run_script_file(rt: &mut Runtime, file: &Path, gc_stress: bool) -> Exit
 async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let mut rt = match Runtime::create_with(zuqe_whatwg::aike::AikeRuntimeState::new()) {
+    zuqe_whatwg::install_state_accessor(whatwg_state);
+    let mut rt = match Runtime::create_with(WptState {
+        whatwg: zuqe_whatwg::WhatwgState::new(),
+    }) {
         Ok(r) => r,
         Err(_) => {
             eprintln!("wpt_runtime: failed to create runtime");

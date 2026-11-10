@@ -6,14 +6,14 @@ use std::time::Instant;
 use zuqe::{CallContext, FieldDef, JSResult, JSValue, Object, ScopedContext};
 
 use crate::{
-    aike::AikeRuntimeState,
-    color::{Color, colorize},
+    helpers::{Color, colorize},
     inspect_value::js_inspect,
+    state::WhatwgState,
 };
 
 #[inline(always)]
 fn console_println(msg: String) {
-    crate::repl::print_output(msg.into());
+    crate::state::print_output(msg.into());
 }
 
 /// Format a value for `console.log`/... output. Top-level strings are printed
@@ -40,7 +40,7 @@ fn js_console_print(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     };
 
     let mut out = String::new();
-    let indent = AikeRuntimeState::of(ctx).console_group_indent;
+    let indent = WhatwgState::of(ctx).console_group_indent;
     for _ in 0..indent {
         out.push_str(&colorize("  ", clr()));
     }
@@ -66,7 +66,7 @@ fn js_console_print(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 fn js_console_assert(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     if cc.length() == 0 || !cc.arg(0).to_bool()? {
         let mut out = String::new();
-        let indent = AikeRuntimeState::of(ctx).console_group_indent;
+        let indent = WhatwgState::of(ctx).console_group_indent;
         for _ in 0..indent {
             out.push_str(&colorize("  ", Color::RedFg));
         }
@@ -84,7 +84,7 @@ fn js_console_assert(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 }
 
 fn js_console_trace(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
-    let indent = AikeRuntimeState::of(ctx).console_group_indent;
+    let indent = WhatwgState::of(ctx).console_group_indent;
     let mut out = String::new();
     for _ in 0..indent {
         out.push_str(&colorize("  ", Color::Reset));
@@ -117,7 +117,7 @@ fn js_console_trace(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 }
 
 fn js_console_dir(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
-    let indent = AikeRuntimeState::of(ctx).console_group_indent;
+    let indent = WhatwgState::of(ctx).console_group_indent;
     let mut out = String::new();
     for _ in 0..indent {
         out.push_str(&colorize("  ", Color::Reset));
@@ -137,7 +137,7 @@ fn js_console_count(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     };
 
     let count = {
-        let n = AikeRuntimeState::of(ctx)
+        let n = WhatwgState::of(ctx)
             .console_counters
             .entry(label.clone())
             .or_insert(0);
@@ -146,7 +146,7 @@ fn js_console_count(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     };
 
     let mut out = String::new();
-    let indent = AikeRuntimeState::of(ctx).console_group_indent;
+    let indent = WhatwgState::of(ctx).console_group_indent;
     for _ in 0..indent {
         out.push_str(&colorize("  ", Color::Reset));
     }
@@ -163,7 +163,7 @@ fn js_console_count_reset(ctx: &mut ScopedContext, cc: CallContext) -> JSResult 
         "default".to_string()
     };
 
-    AikeRuntimeState::of(ctx).console_counters.remove(&label);
+    WhatwgState::of(ctx).console_counters.remove(&label);
 
     Ok(JSValue::UNDEFINED)
 }
@@ -175,12 +175,9 @@ fn js_console_time(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         "default".to_string()
     };
 
-    if AikeRuntimeState::of(ctx)
-        .console_timers
-        .contains_key(&label)
-    {
+    if WhatwgState::of(ctx).console_timers.contains_key(&label) {
         let mut out = String::new();
-        let indent = AikeRuntimeState::of(ctx).console_group_indent;
+        let indent = WhatwgState::of(ctx).console_group_indent;
         for _ in 0..indent {
             out.push_str(&colorize("  ", Color::YellowFg));
         }
@@ -190,7 +187,7 @@ fn js_console_time(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         ));
         console_println(out);
     } else {
-        AikeRuntimeState::of(ctx)
+        WhatwgState::of(ctx)
             .console_timers
             .insert(label, Instant::now());
     }
@@ -205,13 +202,13 @@ fn js_console_time_log(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         "default".to_string()
     };
 
-    let elapsed_ms = AikeRuntimeState::of(ctx)
+    let elapsed_ms = WhatwgState::of(ctx)
         .console_timers
         .get(&label)
         .map(|start| start.elapsed().as_secs_f64() * 1000.0);
 
     let mut out = String::new();
-    let indent = AikeRuntimeState::of(ctx).console_group_indent;
+    let indent = WhatwgState::of(ctx).console_group_indent;
     for _ in 0..indent {
         out.push_str(&colorize("  ", Color::Reset));
     }
@@ -244,13 +241,13 @@ fn js_console_time_end(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         "default".to_string()
     };
 
-    let elapsed = AikeRuntimeState::of(ctx)
+    let elapsed = WhatwgState::of(ctx)
         .console_timers
         .remove(&label)
         .map(|start| start.elapsed().as_secs_f64() * 1000.0);
 
     let mut out = String::new();
-    let indent = AikeRuntimeState::of(ctx).console_group_indent;
+    let indent = WhatwgState::of(ctx).console_group_indent;
     for _ in 0..indent {
         out.push_str(&colorize("  ", Color::Reset));
     }
@@ -273,12 +270,12 @@ fn js_console_time_end(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 }
 
 fn js_console_group(ctx: &mut ScopedContext, _cc: CallContext) -> JSResult {
-    AikeRuntimeState::of(ctx).console_group_indent += 1;
+    WhatwgState::of(ctx).console_group_indent += 1;
     Ok(JSValue::UNDEFINED)
 }
 
 fn js_console_group_end(ctx: &mut ScopedContext, _cc: CallContext) -> JSResult {
-    let indent = &mut AikeRuntimeState::of(ctx).console_group_indent;
+    let indent = &mut WhatwgState::of(ctx).console_group_indent;
     *indent = indent.saturating_sub(1);
     Ok(JSValue::UNDEFINED)
 }
@@ -311,7 +308,7 @@ fn js_console_table(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 }
 
 /// Create and register the `console` object on globalThis.
-pub(crate) fn init_console(ctx: &mut ScopedContext, global: &mut Object) -> Result<(), i32> {
+pub fn init_console(ctx: &mut ScopedContext, global: &mut Object) -> Result<(), i32> {
     // `console` is a namespace object: its methods are own properties, and its
     // [[Prototype]] is an empty object whose own [[Prototype]] is %ObjectPrototype%.
     // WPT requires getPrototypeOf(console) to have no own properties.

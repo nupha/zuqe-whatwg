@@ -3,7 +3,7 @@
 
 //! WHATWG Timers Standard: setTimeout, setInterval, clearTimeout, clearInterval.
 //!
-//! Timer state is **per-runtime**, stored on `AikeRuntimeState`: each runtime's
+//! Timer state is **per-runtime**, stored on `WhatwgState`: each runtime's
 //! pending timers live in its own list and are driven by a polling job queued in
 //! that runtime's own context, so a child runtime's timer callbacks are always
 //! invoked with the child's context. The list is kept sorted by `deadline`
@@ -14,12 +14,10 @@ use std::time::{Duration, Instant};
 
 use zuqe::{
     CallContext, Callback, Exception, JS_PROP_C_W_E, JSResult, JSValue, JobState, Object,
-    ScopedContext,
-    builtins::promise::Promise,
-    gc_lite::GcTrace,
+    ScopedContext, gc_lite::GcTrace,
 };
 
-use crate::aike::AikeRuntimeState;
+use crate::state::WhatwgState;
 
 // ---------------------------------------------------------------------------
 // Per-runtime timer entries
@@ -42,7 +40,7 @@ struct TimerEntry {
     deadline: Instant,
 }
 
-/// Per-runtime timer queue, stored on `AikeRuntimeState`.
+/// Per-runtime timer queue, stored on `WhatwgState`.
 #[derive(Default, GcTrace)]
 #[gc(crate_path = zuqe::gc_lite)]
 pub(crate) struct TimerState {
@@ -53,7 +51,7 @@ pub(crate) struct TimerState {
 }
 
 fn next_timer_id(ctx: &mut ScopedContext) -> u32 {
-    let n = &mut AikeRuntimeState::of(ctx).timer_serial;
+    let n = &mut WhatwgState::of(ctx).timer_serial;
     let id = *n;
     *n = id + 1;
     id
@@ -76,14 +74,14 @@ fn start_timer_task(ctx: &mut ScopedContext) {
             let now = Instant::now();
 
             // Fast path: nearest deadline not due yet (or no timers) → bail.
-            let nearest = AikeRuntimeState::of(cx)
+            let nearest = WhatwgState::of(cx)
                 .timers
                 .entries
                 .first()
                 .map(|e| e.deadline);
             match nearest {
                 None => {
-                    AikeRuntimeState::of(cx).timers.job_active = false;
+                    WhatwgState::of(cx).timers.job_active = false;
                     return Ok(JobState::Done);
                 }
                 Some(t) if now < t => {
@@ -96,7 +94,7 @@ fn start_timer_task(ctx: &mut ScopedContext) {
             // At least one timer is due: fire every elapsed timer in order.
             loop {
                 let step: Option<(Object, Option<u64>, u32)> = {
-                    let s = &mut AikeRuntimeState::of(cx).timers;
+                    let s = &mut WhatwgState::of(cx).timers;
                     let Some(e) = s.entries.first_mut() else {
                         break;
                     };
@@ -135,7 +133,7 @@ fn start_timer_task(ctx: &mut ScopedContext) {
 
                 if let Some(ms) = interval_ms {
                     let new_deadline = Instant::now() + Duration::from_millis(ms);
-                    let s = &mut AikeRuntimeState::of(cx).timers;
+                    let s = &mut WhatwgState::of(cx).timers;
                     if let Some(pos) = s.entries.iter().position(|e| e.id == id) {
                         let mut e = s.entries.remove(pos);
                         e.deadline = new_deadline;
@@ -149,7 +147,7 @@ fn start_timer_task(ctx: &mut ScopedContext) {
                 // already reported above; just discard.
             }
 
-            let next = AikeRuntimeState::of(cx)
+            let next = WhatwgState::of(cx)
                 .timers
                 .entries
                 .first()
@@ -162,7 +160,7 @@ fn start_timer_task(ctx: &mut ScopedContext) {
                     Ok(JobState::Block)
                 }
                 None => {
-                    AikeRuntimeState::of(cx).timers.job_active = false;
+                    WhatwgState::of(cx).timers.job_active = false;
                     Ok(JobState::Done)
                 }
             }
@@ -186,7 +184,7 @@ fn register_timer(ctx: &mut ScopedContext, cc: CallContext, is_interval: bool) -
     let deadline = Instant::now() + Duration::from_millis(delay_ms);
     let id = next_timer_id(ctx);
     let need_start = {
-        let s = &mut AikeRuntimeState::of(ctx).timers;
+        let s = &mut WhatwgState::of(ctx).timers;
         insert_sorted(
             &mut s.entries,
             TimerEntry {
@@ -215,7 +213,7 @@ fn clear_timer(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     }
     let id = id as u32;
 
-    let s = &mut AikeRuntimeState::of(ctx).timers;
+    let s = &mut WhatwgState::of(ctx).timers;
     if let Some(pos) = s.entries.iter().position(|e| e.id == id) {
         s.entries.remove(pos);
     }
@@ -223,59 +221,15 @@ fn clear_timer(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     Ok(JSValue::UNDEFINED)
 }
 
-/// `Aike.sleep(ms)` — returns a `Promise` that resolves after `ms` milliseconds.
-///
-/// Uses the same per-runtime timer queue: the promise's native resolve function
-/// serves as a one-shot timer callback.
-pub(crate) fn js_sleep(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
-    let ms = cc.arg(0).to_number(ctx)?.to_f64();
-    let delay_ms = if ms.is_nan() || ms < 0.0 {
-        0
-    } else {
-        ms as u64
-    };
-
-    let (promise, resolving) = Promise::create(ctx)?;
-    let resolve_fn = resolving[0].ensure_callable(ctx)?;
-
-    let deadline = Instant::now() + Duration::from_millis(delay_ms);
-    let id = next_timer_id(ctx);
-    let need_start = {
-        let s = &mut AikeRuntimeState::of(ctx).timers;
-        insert_sorted(
-            &mut s.entries,
-            TimerEntry {
-                id,
-                callback: resolve_fn,
-                interval_ms: None,
-                deadline,
-            },
-        );
-        let need = !s.job_active;
-        s.job_active = true;
-        need
-    };
-
-    if need_start {
-        start_timer_task(ctx);
-    }
-
-    Ok(promise.into())
-}
-
 /// Register a one-shot timer that invokes the JS callable `callback` after
 /// `ms` milliseconds, reusing the runtime timer queue. Used by
-/// `AbortSignal.timeout()` to abort the returned signal after the delay.
-pub(crate) fn register_timer_once(
-    ctx: &mut ScopedContext,
-    callback: JSValue,
-    ms: u64,
-) -> Result<(), i32> {
+/// `AbortSignal.timeout()` and host helpers such as `Aike.sleep`.
+pub fn register_timer_once(ctx: &mut ScopedContext, callback: JSValue, ms: u64) -> Result<(), i32> {
     let callback = callback.ensure_callable(ctx)?;
     let deadline = Instant::now() + Duration::from_millis(ms);
     let id = next_timer_id(ctx);
     let need_start = {
-        let s = &mut AikeRuntimeState::of(ctx).timers;
+        let s = &mut WhatwgState::of(ctx).timers;
         insert_sorted(
             &mut s.entries,
             TimerEntry {
@@ -309,7 +263,7 @@ fn js_timeout(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     }
 }
 
-pub(crate) fn init_timeout(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
+pub fn init_timeout(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
     let f = ctx.create_native_function(
         Callback::Func(js_timeout),
         "setTimeout",

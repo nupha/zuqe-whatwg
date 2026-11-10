@@ -34,7 +34,7 @@ fn js_queue_microtask(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     Ok(JSValue::UNDEFINED)
 }
 
-pub(crate) fn init_microtask(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
+pub fn init_microtask(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
     let f =
         ctx.create_native_function(Callback::Func(js_queue_microtask), "queueMicrotask", 1, 0)?;
     global.define_property_value_str(ctx, "queueMicrotask", f.into(), zuqe::JS_PROP_C_W_E)?;

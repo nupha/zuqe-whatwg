@@ -637,7 +637,7 @@ def_native_object!(
 /// Mount `URL.createObjectURL` / `URL.revokeObjectURL` as static methods on the
 /// global `URL` constructor. These back the WHATWG object-URL store used by
 /// `fetch('blob:...')`.
-pub(crate) fn init_url(ctx: &mut ScopedContext, global: &mut Object) -> Result<(), i32> {
+pub fn init_url(ctx: &mut ScopedContext, global: &mut Object) -> Result<(), i32> {
     let create_fn = ctx.create_native_function(
         zuqe::Callback::Func(js_url_create_object_url),
         "createObjectURL",
@@ -705,7 +705,7 @@ def_native_object!(
 
 /// Extract the URL text from a `URL` instance or a plain string. Used by
 /// `path.fileURLToPath`; any other value throws a TypeError.
-pub(crate) fn url_arg_to_str(ctx: &mut ScopedContext, val: &JSValue) -> Result<String, i32> {
+pub fn url_arg_to_str(ctx: &mut ScopedContext, val: &JSValue) -> Result<String, i32> {
     if let Some(s) = val.as_string(false) {
         return Ok(s.content().encode_utf8(false).to_string());
     }
@@ -717,7 +717,7 @@ pub(crate) fn url_arg_to_str(ctx: &mut ScopedContext, val: &JSValue) -> Result<S
 
 /// Build a `URL` object from an already-parsed `url::Url`. Used by
 /// `path.pathToFileURL`, which returns a URL per Node's convention.
-pub(crate) fn new_url(ctx: &mut ScopedContext, parsed: Url) -> Result<JSValue, i32> {
+pub fn new_url(ctx: &mut ScopedContext, parsed: Url) -> Result<JSValue, i32> {
     JSURL::new_instance(
         ctx,
         JSValue::UNDEFINED,

@@ -12,7 +12,6 @@ use zuqe::{
     CallContext, ClassCtorDef, FieldDef, JSResult, JSValue, ScopedContext, def_native_object,
 };
 
-// No JS GC nodes in this payload.
 pub(crate) struct DOMExceptionPayload {
     name: String,
     message: String,
@@ -132,7 +131,7 @@ def_native_object!(
 ///
 /// Used by abort/fetch to produce a real `AbortError`/`TimeoutError` whose
 /// `code`, `name` and `constructor` satisfy WPT's DOMException assertions.
-pub(crate) fn make_dom_exception(ctx: &mut ScopedContext, name: &str, message: &str) -> JSResult {
+pub fn make_dom_exception(ctx: &mut ScopedContext, name: &str, message: &str) -> JSResult {
     let payload = DOMExceptionPayload {
         code: dom_exception_code(name),
         message: message.to_string(),

@@ -24,14 +24,16 @@ mod writable_controller;
 mod writer;
 
 pub(crate) use {
-    readable::{
-        ChannelStreamState, JSReadableStream, ReadableStreamPayload, init_readable_stream_statics,
-    },
-    readable_byob_request::JSReadableStreamBYOBRequest,
+    readable::{ChannelStreamState, ReadableStreamPayload},
     readable_controller::ReadableControllerPayload,
+    readable_tee::TeeStreamState,
+};
+
+pub use {
+    readable::{JSReadableStream, init_readable_stream_statics},
+    readable_byob_request::JSReadableStreamBYOBRequest,
     readable_controller_byte::JSReadableByteStreamController,
     readable_controller_default::JSReadableStreamDefaultController,
-    readable_tee::TeeStreamState,
     reader::JSReadableStreamDefaultReader,
     transform::JSTransformStream,
     transform_controller::JSTransformStreamDefaultController,

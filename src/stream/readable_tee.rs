@@ -16,7 +16,7 @@ use zuqe::{
     gc_lite::{GcTrace, GcTraceCtx},
 };
 
-use crate::aike::AikeRuntimeState;
+use crate::state::WhatwgState;
 
 use super::{
     JSReadableByteStreamController, JSReadableStream, JSReadableStreamDefaultController,
@@ -27,7 +27,7 @@ use super::{
 /// Shared state for a `tee()` split: one source reader feeding two branch
 /// controllers on demand. `pulling` guards against concurrent pulls from both
 /// branches; `done` stops pulling once the source finishes.
-/// This struct lives in `AikeRuntimeState::tee_streams` (root container);
+/// This struct lives in `WhatwgState::tee_streams` (root container);
 /// writes to `cancel_reason1/2`/`cancel_promise` do not require a write barrier
 /// as long as it remains rooted there. If moved out of the runtime root in the
 /// future, add barriers/guards accordingly.
@@ -54,7 +54,7 @@ pub(crate) struct TeeShared {
     cancel_promise: RefCell<Option<Promise>>,
 }
 
-/// Per-runtime active `tee()` splits, stored on `AikeRuntimeState`.
+/// Per-runtime active `tee()` splits, stored on `WhatwgState`.
 #[derive(Default, GcTrace)]
 #[gc(crate_path = zuqe::gc_lite)]
 pub(crate) struct TeeStreamState {
@@ -97,7 +97,7 @@ impl JSReadableStreamDefaultReader {
         // branch controllers). Pull only fires when a branch actually needs data, so
         // an infinite source is never drained unless a branch asks for it.
         let tee_id = {
-            let st = AikeRuntimeState::of(ctx);
+            let st = WhatwgState::of(ctx);
             let id = st.tee_streams.next_id;
             st.tee_streams.next_id = id + 1;
             id
@@ -217,7 +217,7 @@ impl JSReadableStreamDefaultReader {
             cancel_reason2: RefCell::new(None),
             cancel_promise: RefCell::new(Some(cancel_promise)),
         });
-        AikeRuntimeState::of(ctx)
+        WhatwgState::of(ctx)
             .tee_streams
             .streams
             .insert(tee_id, shared);
@@ -235,7 +235,7 @@ fn tee_cancel(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     let tee_id = cc.data(0).to_number(ctx)?.to_u32();
     let branch = cc.data(1).to_number(ctx)?.to_u32();
     let reason = cc.arg(0);
-    let shared = AikeRuntimeState::of(ctx)
+    let shared = WhatwgState::of(ctx)
         .tee_streams
         .streams
         .get(&tee_id)
@@ -345,7 +345,7 @@ pub(crate) fn js_readable_stream_tee(ctx: &mut ScopedContext, cc: CallContext) -
 // both branches; a shared `done` stops pulling after the source finishes.
 fn tee_pull(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     let tee_id = cc.data(0).to_number(ctx)?.to_u32();
-    let shared = AikeRuntimeState::of(ctx)
+    let shared = WhatwgState::of(ctx)
         .tee_streams
         .streams
         .get(&tee_id)
@@ -360,7 +360,7 @@ fn tee_pull(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 // pulling guard. Close both when the source is done.
 fn tee_pull_fulfilled(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     let tee_id = cc.data(0).to_number(ctx)?.to_u32();
-    let shared = AikeRuntimeState::of(ctx)
+    let shared = WhatwgState::of(ctx)
         .tee_streams
         .streams
         .get(&tee_id)
@@ -383,10 +383,7 @@ fn tee_pull_fulfilled(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
                 cp.close(ctx)?;
             }
         }
-        AikeRuntimeState::of(ctx)
-            .tee_streams
-            .streams
-            .remove(&tee_id);
+        WhatwgState::of(ctx).tee_streams.streams.remove(&tee_id);
         return Ok(JSValue::UNDEFINED);
     }
 
@@ -450,7 +447,7 @@ fn tee_pull_fulfilled(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 // was fanned out, when a branch still wants data).
 fn tee_pull_continue(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     let tee_id = cc.data(0).to_number(ctx)?.to_u32();
-    if let Some(shared) = AikeRuntimeState::of(ctx)
+    if let Some(shared) = WhatwgState::of(ctx)
         .tee_streams
         .streams
         .get(&tee_id)
@@ -483,10 +480,7 @@ fn tee_do_pull(ctx: &mut ScopedContext, tee_id: u32, shared: &TeeShared) -> JSRe
                     c.invoke_str(ctx, "error", &[reason])?;
                 }
             }
-            AikeRuntimeState::of(ctx)
-                .tee_streams
-                .streams
-                .remove(&tee_id);
+            WhatwgState::of(ctx).tee_streams.streams.remove(&tee_id);
             return Ok(JSValue::UNDEFINED);
         }
     }
@@ -521,7 +515,7 @@ fn tee_do_pull(ctx: &mut ScopedContext, tee_id: u32, shared: &TeeShared) -> JSRe
 // Source read rejected: error both branches and clear the pulling guard.
 fn tee_pull_rejected(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     let tee_id = cc.data(0).to_number(ctx)?.to_u32();
-    let shared = AikeRuntimeState::of(ctx)
+    let shared = WhatwgState::of(ctx)
         .tee_streams
         .streams
         .get(&tee_id)
@@ -537,10 +531,7 @@ fn tee_pull_rejected(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
             c.invoke_str(ctx, "error", &[reason])?;
         }
     }
-    AikeRuntimeState::of(ctx)
-        .tee_streams
-        .streams
-        .remove(&tee_id);
+    WhatwgState::of(ctx).tee_streams.streams.remove(&tee_id);
     Ok(JSValue::UNDEFINED)
 }
 

@@ -14,6 +14,8 @@
 
 pub(crate) mod subtle;
 
+pub use subtle::JSCryptoSubtle;
+
 use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -46,10 +48,7 @@ pub(crate) fn throw_dom_exception(ctx: &mut ScopedContext, name: &str, message: 
 /// Copy the bytes of a WHATWG `BufferSource` (ArrayBuffer or ArrayBufferView,
 /// including DataView). Mirrors the WebCrypto `copyBufferSource` abstract op.
 /// Throws `TypeError` on a non-BufferSource value or a detached buffer.
-pub(crate) fn get_buffer_source_bytes(
-    ctx: &mut ScopedContext,
-    val: &JSValue,
-) -> Result<Vec<u8>, i32> {
+pub fn get_buffer_source_bytes(ctx: &mut ScopedContext, val: &JSValue) -> Result<Vec<u8>, i32> {
     let mut out = Vec::new();
     if let Some(mut ab) = val.as_object_ArrayBuffer() {
         ab.ensure_attached(ctx)?;
@@ -370,7 +369,7 @@ def_native_object!(
 // ===========================================================================
 
 /// Install the `crypto` global (a `Crypto` instance carrying its `subtle`).
-pub(crate) fn init_crypto(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
+pub fn init_crypto(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
     let subtle = subtle::JSCryptoSubtle::new_instance(ctx, JSValue::UNDEFINED)?;
     let crypto = JSCrypto::new_instance(
         ctx,

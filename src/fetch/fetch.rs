@@ -31,8 +31,8 @@ use crate::fetch::cache as http_cache;
 
 use crate::{
     abort::{JSAbortSignal, signal_is_aborted, signal_notify, signal_reason},
-    aike::AikeRuntimeState,
     dom::make_dom_exception,
+    state::WhatwgState,
     stream::JSReadableStream,
 };
 
@@ -338,7 +338,6 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         credentials = String::from("include");
     }
 
-
     // CORS tainting: a cross-origin request in `cors` mode. These require
     // origin/ACAO handling and (for non-safelisted requests) a preflight.
     // Computed up front so the response callback (created below) can reference
@@ -427,7 +426,6 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         );
     }
 
-
     #[cfg(feature = "fetch_cache")]
     if let Some(hit) = cache_hit {
         // `only-if-cached` requires `mode: "same-origin"`; if the cached
@@ -474,7 +472,6 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
         // `fetch()` returns a promise; resolve it with the cached Response.
         return Promise::from_resolve_value(ctx, response).map(JSValue::from);
     }
-
 
     // RFC 9111 §3.3: a stored *incomplete* (`206`) response cannot be served
     // for a request for the complete resource, but the fetch is completed by
@@ -706,7 +703,7 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 
     // Runtime TLS escape hatch: `fetch.allowInsecureTLS` skips cert validation
     // for this request's client.
-    let insecure = AikeRuntimeState::of(ctx).fetch_allow_insecure_tls;
+    let insecure = WhatwgState::of(ctx).fetch_allow_insecure_tls;
 
     // Fetch spec "HTTP defaults": a request carries default `Accept` and
     // `Accept-Language` headers unless the caller overrides them. reqwest's
@@ -838,7 +835,7 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
     // the entry that the convert closure's Drop guard removes on settle.
     let signal_for_reason: usize = match &signal_val {
         Some(s) => {
-            let st = AikeRuntimeState::of(ctx);
+            let st = WhatwgState::of(ctx);
             let id = st.fetch_signal_next_id;
             st.fetch_signal_next_id = id.wrapping_add(1);
             st.fetch_signals.insert(id, *s);
@@ -856,9 +853,7 @@ fn fetch_impl(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
             // (on commit), so this mirrors the previous Drop guard while
             // needing no context in a destructor.
             let signal_root = if signal_for_reason != 0 {
-                AikeRuntimeState::of(cx)
-                    .fetch_signals
-                    .remove(&signal_for_reason)
+                WhatwgState::of(cx).fetch_signals.remove(&signal_for_reason)
             } else {
                 None
             };
@@ -1446,7 +1441,7 @@ fn set_content_length(headers: &mut Vec<(String, String)>, len: usize) {
 }
 
 /// Install the `fetch` global and register all WHATWG classes.
-pub(crate) fn init_fetch(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
+pub fn init_fetch(ctx: &mut ScopedContext, mut global: Object) -> Result<(), i32> {
     // The fetch standard classes live in `client`; each ClassCtorDef carries
     // `expose_to_global()`, so registering them installs the `Request`,
     // `Response` and `Headers` globals.
@@ -1474,7 +1469,7 @@ pub(crate) fn init_fetch(ctx: &mut ScopedContext, mut global: Object) -> Result<
 
     // Runtime-level switches as accessor properties on the `fetch` function
     // object (not per-request). The getter/setter reads/writes
-    // `AikeRuntimeState`. (Browser CORS/cookie semantics have no switch: they
+    // `WhatwgState`. (Browser CORS/cookie semantics have no switch: they
     // are the compile-time `fetch_cors_cookie` decision.)
     {
         let mut func = func;
@@ -1523,9 +1518,7 @@ pub(crate) fn init_fetch(ctx: &mut ScopedContext, mut global: Object) -> Result<
 
 /// `fetch.allowInsecureTLS` getter — whether TLS validation is skipped.
 fn js_fetch_allow_insecure_get(ctx: &mut ScopedContext, _cc: CallContext) -> JSResult {
-    Ok(JSValue::from(
-        AikeRuntimeState::of(ctx).fetch_allow_insecure_tls,
-    ))
+    Ok(JSValue::from(WhatwgState::of(ctx).fetch_allow_insecure_tls))
 }
 
 /// `fetch.allowInsecureTLS` setter — strict boolean.
@@ -1536,7 +1529,7 @@ fn js_fetch_allow_insecure_set(ctx: &mut ScopedContext, cc: CallContext) -> JSRe
             return Err(ctx.throw_type_error("`fetch.allowInsecureTLS` must be a boolean"));
         }
     };
-    AikeRuntimeState::of(ctx).fetch_allow_insecure_tls = b;
+    WhatwgState::of(ctx).fetch_allow_insecure_tls = b;
     Ok(JSValue::UNDEFINED)
 }
 

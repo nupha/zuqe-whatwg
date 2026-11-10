@@ -37,4 +37,5 @@ pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod transport;
 
-pub(crate) use {fetch::init_fetch, referrer::compute_request_referrer};
+pub use fetch::init_fetch;
+pub(crate) use referrer::compute_request_referrer;
