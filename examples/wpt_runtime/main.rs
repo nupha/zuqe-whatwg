@@ -29,6 +29,9 @@ struct Args {
     testharness: Option<PathBuf>,
     #[arg(long, default_value_t = 10000u64)]
     timeout_ms: u64,
+    /// Enable GC stress (debug + gc_generations builds) to catch young/old GC issues.
+    #[arg(long, default_value_t = false)]
+    gc_stress: bool,
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 }
@@ -183,6 +186,7 @@ async fn run_wpt_file(
     testharness: &str,
     file: &Path,
     timeout: Duration,
+    gc_stress: bool,
 ) -> (u32, u32, Vec<String>) {
     let code = match std::fs::read_to_string(file) {
         Ok(c) => c,
@@ -243,6 +247,12 @@ Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
     // Fresh context per file to avoid cross-file global redeclarations (closer to aike runner).
     let mut ctx = match rt.create_context(|cx| {
         ScopedContext::ECMA_CONTEXT_SETUP(cx)?;
+        #[cfg(debug_assertions)]
+        if gc_stress {
+            cx.rt_mut().gc_set_stress(true);
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = gc_stress;
         let global = cx.global_obj();
         zuqe_whatwg::init_whatwg(cx, global)?;
         setup_wpt_globals(cx)?;
@@ -341,7 +351,7 @@ Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
     })
 }
 
-async fn run_script_file(rt: &mut Runtime, file: &Path) -> ExitCode {
+async fn run_script_file(rt: &mut Runtime, file: &Path, gc_stress: bool) -> ExitCode {
     let code = match std::fs::read_to_string(file) {
         Ok(c) => c,
         Err(e) => {
@@ -351,6 +361,12 @@ async fn run_script_file(rt: &mut Runtime, file: &Path) -> ExitCode {
     };
     let mut ctx = match rt.create_context(|cx| {
         ScopedContext::ECMA_CONTEXT_SETUP(cx)?;
+        #[cfg(debug_assertions)]
+        if gc_stress {
+            cx.rt_mut().gc_set_stress(true);
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = gc_stress;
         let global = cx.global_obj();
         zuqe_whatwg::init_whatwg(cx, global)?;
         setup_wpt_globals(cx)?;
@@ -422,7 +438,7 @@ async fn main() -> ExitCode {
     });
 
     if !looks_wpt && args.inputs.len() == 1 && args.inputs[0].is_file() {
-        return run_script_file(&mut rt, &args.inputs[0]).await;
+        return run_script_file(&mut rt, &args.inputs[0], args.gc_stress).await;
     }
 
     let testharness_path = if let Some(p) = args.testharness.clone() {
@@ -457,7 +473,14 @@ async fn main() -> ExitCode {
     let timeout = Duration::from_millis(args.timeout_ms);
     for t in &tests {
         println!("# running {}", t.display());
-        let run = AssertUnwindSafe(run_wpt_file(&mut rt, &testharness, t, timeout)).catch_unwind();
+        let run = AssertUnwindSafe(run_wpt_file(
+            &mut rt,
+            &testharness,
+            t,
+            timeout,
+            args.gc_stress,
+        ))
+        .catch_unwind();
         let (p, f, fails) = match run.await {
             Ok(r) => r,
             Err(payload) => {

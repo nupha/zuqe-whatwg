@@ -18,14 +18,10 @@ name = "wpt_runtime"
 required-features = ["fetch_cors_cookie", "fetch_cache"]
 
 [dependencies]
-zuqe = { path = "../../zhuque", features = [
-    "jit",
+zuqe = { version = "0.11.2", features = [
     "gc_generations",
     "crossbeam_channel",
     "serde_json_support",
-    "persistent",
-    "child_runtime",
-    "intl402",
 ] }
 crossbeam = "0.8"
 tokio = { version = "1", features = [
