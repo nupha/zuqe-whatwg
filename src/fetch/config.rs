@@ -261,7 +261,9 @@ mod cookie_jar_impl {
         if name.is_empty() {
             return;
         }
-        let mut order = global_cookie_order().write().unwrap_or_else(|e| e.into_inner());
+        let mut order = global_cookie_order()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         // Re-register on every `Set-Cookie`: move the name to the end rather than
         // keeping its first-ever position. The table is process-global and never
         // pruned, so a stale entry left by an earlier test or file would otherwise
@@ -276,7 +278,9 @@ mod cookie_jar_impl {
     /// Names not in the recorded order (e.g. overwritten/expired) are kept at the
     /// end in their original relative order.
     pub(crate) fn reorder_cookie_header(value: &str) -> String {
-        let order = global_cookie_order().read().unwrap_or_else(|e| e.into_inner());
+        let order = global_cookie_order()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut pairs: Vec<(usize, &str)> = value
             .split("; ")
             .map(|pair| {
