@@ -76,6 +76,40 @@ pub(crate) struct AbortSignalPayload {
     inner: Rc<RefCell<SignalInner>>,
 }
 
+impl GcTrace for AbortSignalPayload {
+    fn trace(&self, gcx: &mut GcTraceCtx) {
+        // Custom trace: traverses `dependents` (strong Rc refs) with careful borrow
+        // discipline (clone vec, drop borrow, then trace each dependent's GC fields)
+        // so dependent signals/listeners/reasons stay alive per spec while avoiding
+        // borrow conflicts; not expressible as a plain field-wise derive.
+        let inner = self.inner.borrow();
+        inner.reason.trace(gcx);
+        inner.signal.trace(gcx);
+        inner.controller.trace(gcx);
+        for l in inner.listeners.iter() {
+            l.cb.trace(gcx);
+        }
+
+        // Dependents are held by strong Rc refs but their JS payloads
+        // (signal object/reason/listeners) still need tracing; per spec a
+        // non-aborted dependent must not be GC'd while its source is alive.
+        // The dependent's `signal` (its own JS object) is traced so the
+        // `abort` event's `target` can never dangle.
+        let dependents = inner.dependents.clone();
+        drop(inner);
+
+        for dep in dependents {
+            let d = dep.borrow();
+            d.signal.trace(gcx);
+            d.reason.trace(gcx);
+            d.controller.trace(gcx);
+            for l in d.listeners.iter() {
+                l.cb.trace(gcx);
+            }
+        }
+    }
+}
+
 fn get_signal<'a>(
     ctx: &mut ScopedContext,
     val: &'a JSValue,
@@ -413,6 +447,12 @@ fn js_signal_static_any(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
             let mut sr = source.borrow_mut();
             if !sr.dependents.iter().any(|d| Rc::ptr_eq(d, &result_inner)) {
                 sr.dependents.push(result_inner.clone());
+                // Adding a dependent extends this source's GC-traced reach
+                // (gc_trace walks each dependent's fields). Mark old source dirty
+                // for minor GC (remembered-set re-scan) so it re-traces dependents.
+                if let Some(src_obj) = sr.signal.get() {
+                    ctx.gc_set_minor_dirty_value(src_obj.into());
+                }
             }
         }
     }
@@ -427,6 +467,20 @@ fn js_signal_static_any(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 pub(crate) struct AbortControllerPayload {
     signal: Object,
     inner: Rc<RefCell<SignalInner>>,
+}
+
+impl GcTrace for AbortControllerPayload {
+    fn trace(&self, gcx: &mut GcTraceCtx) {
+        // Custom trace: traces only `signal` (the controller→signal GC edge). The
+        // shared `inner` state is traced through `AbortSignalPayload`; deriving would
+        // also trace `inner` (and requires `SignalInner` to be derivable), changing
+        // semantics.
+        //
+        // Keep the associated signal alive: the controller→signal link is the
+        // only GC-traceable edge into the shared signal state for a signal
+        // referenced solely via `AbortController.signal`.
+        self.signal.trace(gcx);
+    }
 }
 
 fn get_controller<'a>(
@@ -521,8 +575,7 @@ fn js_controller_abort(ctx: &mut ScopedContext, cc: CallContext) -> JSResult {
 ///
 /// `owner` is the instance the abort was initiated on: `reason` may be young
 /// while an owner's payload is already old, so the edge is recorded for the
-/// generational GC (the dependents' payloads report the same `reason`, which
-/// the single bind keeps alive for them too).
+/// generational GC on the object that actually owns/traces the field.
 fn do_signal_abort(
     ctx: &mut ScopedContext,
     inner: &Rc<RefCell<SignalInner>>,
@@ -550,21 +603,23 @@ fn do_signal_abort(
     let mut queue: VecDeque<Rc<RefCell<SignalInner>>> = dependents.into();
     let mut to_fire: Vec<Rc<RefCell<SignalInner>>> = Vec::new();
     while let Some(cur) = queue.pop_front() {
-        let children: Vec<Rc<RefCell<SignalInner>>> = {
+        let children = {
             let mut d = cur.borrow_mut();
             if d.aborted {
                 continue;
             }
             d.aborted = true;
-            // Same `owner` edge as the source's: one recorded edge covers
-            // every dependent's copy of the reason.
-            d.reason.set(ctx, owner, reason);
+            // Record the barrier on the dependent signal's own JS object (the
+            // GC node that traces this `reason` field), not the source owner.
+            let dep_owner = d.signal.get().map(JSValue::from).unwrap_or(owner);
+            d.reason.set(ctx, dep_owner, reason);
             d.notify.notify_waiters();
             d.dependents.clone()
         };
         to_fire.push(cur);
         queue.extend(children);
     }
+
     // Then run abort steps: source first, dependents in order (spec steps 4-6).
     fire_abort_events(ctx, inner);
     for dep in to_fire {
@@ -637,62 +692,6 @@ impl AbortSignalPayload {
     pub(crate) fn notify(&self) -> Arc<Notify> {
         self.inner.borrow().notify.clone()
     }
-
-    fn gc_trace(&self, gcx: &mut GcTraceCtx) {
-        let inner = self.inner.borrow();
-        inner.reason.trace(gcx);
-        inner.signal.trace(gcx);
-        inner.controller.trace(gcx);
-        for l in inner.listeners.iter() {
-            l.cb.trace(gcx);
-        }
-        // Dependents are held by strong Rc refs but their JS payloads
-        // (signal object/reason/listeners) still need tracing; per spec a
-        // non-aborted dependent must not be GC'd while its source is alive.
-        // The dependent's `signal` (its own JS object) is traced so the
-        // `abort` event's `target` can never dangle.
-        let dependents = inner.dependents.clone();
-        drop(inner);
-
-        for dep in dependents {
-            let d = dep.borrow();
-            d.signal.trace(gcx);
-            d.reason.trace(gcx);
-            d.controller.trace(gcx);
-            for l in d.listeners.iter() {
-                l.cb.trace(gcx);
-            }
-        }
-    }
-}
-
-// Custom trace: traverses `dependents` (strong Rc refs) with careful borrow
-// discipline (clone vec, drop borrow, then trace each dependent's GC fields)
-// so dependent signals/listeners/reasons stay alive per spec while avoiding
-// borrow conflicts; not expressible as a plain field-wise derive.
-impl GcTrace for AbortSignalPayload {
-    fn trace(&self, gcx: &mut GcTraceCtx) {
-        self.gc_trace(gcx);
-    }
-}
-
-impl AbortControllerPayload {
-    fn gc_trace(&self, gcx: &mut GcTraceCtx) {
-        // Keep the associated signal alive: the controller→signal link is the
-        // only GC-traceable edge into the shared signal state for a signal
-        // referenced solely via `AbortController.signal`.
-        self.signal.trace(gcx);
-    }
-}
-
-// Custom trace: traces only `signal` (the controller→signal GC edge). The
-// shared `inner` state is traced through `AbortSignalPayload`; deriving would
-// also trace `inner` (and requires `SignalInner` to be derivable), changing
-// semantics.
-impl GcTrace for AbortControllerPayload {
-    fn trace(&self, gcx: &mut GcTraceCtx) {
-        self.gc_trace(gcx);
-    }
 }
 
 /// Get the abort `Notify` for a JS `AbortSignal` value, if it is one.
@@ -744,7 +743,14 @@ pub(crate) fn signal_attach_follower(ctx: &mut ScopedContext, parent: &JSValue, 
         let reason = parent_inner.borrow().reason.get();
         do_signal_abort(ctx, &child_inner, *child, reason);
     } else {
-        parent_inner.borrow_mut().dependents.push(child_inner);
+        let mut pi = parent_inner.borrow_mut();
+        pi.dependents.push(child_inner);
+        // Adding a dependent extends the parent's GC-traced reach (gc_trace
+        // walks each dependent's fields). Mark old parent dirty for minor GC
+        // (remembered-set re-scan) so it re-traces dependents.
+        if let Some(parent_obj) = pi.signal.get() {
+            ctx.gc_set_minor_dirty_value(parent_obj.into());
+        }
     }
 }
 
