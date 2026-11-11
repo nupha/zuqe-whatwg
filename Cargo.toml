@@ -18,7 +18,7 @@ name = "wpt_runtime"
 required-features = ["fetch_cors_cookie", "fetch_cache"]
 
 [dependencies]
-zuqe = { version = "0.11.2", features = [
+zuqe = { version = "0.12.0", features = [
     "gc_generations",
     "crossbeam_channel",
     "serde_json_support",
