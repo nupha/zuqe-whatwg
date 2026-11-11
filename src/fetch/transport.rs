@@ -65,10 +65,12 @@ pub(crate) struct TransportRequest {
     pub cors_client_origin: String,
     /// The fetch `credentials` mode: "omit" | "same-origin" | "include". Drives
     /// whether cookies are sent/stored (via the shared global jar).
+    #[cfg_attr(not(feature = "fetch_cors_cookie"), allow(dead_code))]
     pub credentials_mode: String,
     /// Whether this request manages cookies manually via the shared global jar
     /// (the WHATWG `fetch` path). The low-level HTTP client API keeps reqwest's
     /// own per-client cookie store and does not touch the global jar.
+    #[cfg_attr(not(feature = "fetch_cors_cookie"), allow(dead_code))]
     pub use_shared_cookies: bool,
     /// The request's `cache` mode ("default" | "no-store" | "reload" |
     /// "no-cache" | "force-cache" | "only-if-cached"). The transport derives the
@@ -678,6 +680,7 @@ fn method_is_safe(method: &str) -> bool {
 /// Whether cookies may be sent/stored for a request per its `credentials` mode:
 /// "include" always; "same-origin" only when the target URL's origin matches
 /// the client origin; "omit" never.
+#[cfg(feature = "fetch_cors_cookie")]
 fn cookies_allowed(credentials_mode: &str, client_origin: &str, url: &str) -> bool {
     match credentials_mode {
         "include" => true,
@@ -849,6 +852,7 @@ pub(crate) async fn perform_request(
 
         // Fetch cookies from the shared jar when the `credentials` mode permits
         // (include, or same-origin for a same-origin URL). `omit` never sends.
+        #[cfg(feature = "fetch_cors_cookie")]
         if req.use_shared_cookies
             && cookies_allowed(&req.credentials_mode, &req.cors_client_origin, &url)
             && let Ok(u) = url::Url::parse(&url)
@@ -1051,6 +1055,7 @@ pub(crate) async fn perform_request(
     // Store `Set-Cookie` response cookies into the shared jar when the
     // `credentials` mode permits, so a later `fetch()` (with include/same-origin)
     // to the same origin sends them (WPT cors-cookies).
+    #[cfg(feature = "fetch_cors_cookie")]
     if req.use_shared_cookies
         && cookies_allowed(
             &req.credentials_mode,

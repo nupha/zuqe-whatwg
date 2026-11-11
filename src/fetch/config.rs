@@ -6,13 +6,14 @@
 //! Holds proxy, TLS, cookie, DNS, and connection-level options.
 //! `build_http_client()` constructs a `reqwest::Client` from the config.
 
-use std::{
-    net::SocketAddr,
-    sync::{Arc, OnceLock, RwLock},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
+#[cfg(feature = "fetch_cors_cookie")]
+use std::sync::{Arc, OnceLock, RwLock};
+
+#[cfg(feature = "fetch_cors_cookie")]
 use reqwest::header::HeaderValue;
+#[cfg(feature = "fetch_cors_cookie")]
 use url::Url;
 
 /// Protocol version preference.
@@ -168,128 +169,137 @@ impl HttpClientConfig {
     }
 }
 
-/// Shared cookie jar backing both `fetch()` and the `cookieStore` API.
-///
-/// Mirrors `reqwest::cookie::Jar` — which wraps the very same
-/// `cookie_store::CookieStore` — but additionally exposes the store so the
-/// Cookie Store API can enumerate and remove cookies. `fetch` stores/reads
-/// through the same `add_cookie_str`/`cookies` surface, so the HTTP layer and
-/// the script API operate on a single store, as the spec requires.
-pub(crate) struct SharedCookieJar {
-    store: RwLock<cookie_store::CookieStore>,
-}
+#[cfg(feature = "fetch_cors_cookie")]
+mod cookie_jar_impl {
+    use super::*;
 
-impl Default for SharedCookieJar {
-    fn default() -> Self {
-        Self {
-            store: RwLock::new(cookie_store::CookieStore::new()),
+    /// Shared cookie jar backing both `fetch()` and the `cookieStore` API.
+    ///
+    /// Mirrors `reqwest::cookie::Jar` — which wraps the very same
+    /// `cookie_store::CookieStore` — but additionally exposes the store so the
+    /// Cookie Store API can enumerate and remove cookies. `fetch` stores/reads
+    /// through the same `add_cookie_str`/`cookies` surface, so the HTTP layer and
+    /// the script API operate on a single store, as the spec requires.
+    pub(crate) struct SharedCookieJar {
+        store: RwLock<cookie_store::CookieStore>,
+    }
+
+    impl Default for SharedCookieJar {
+        fn default() -> Self {
+            Self {
+                store: RwLock::new(cookie_store::CookieStore::new()),
+            }
         }
     }
-}
 
-impl SharedCookieJar {
-    /// Parse a `Set-Cookie` value and store it as received from `url`.
-    /// Mirrors `reqwest::cookie::Jar::add_cookie_str`, including its use of the
-    /// `cookie` crate for parsing (re-exported by `cookie_store`).
-    pub(crate) fn add_cookie_str(&self, cookie: &str, url: &Url) {
-        let cookies = cookie_store::RawCookie::parse(cookie)
-            .ok()
-            .map(|c| c.into_owned())
-            .into_iter();
-        self.store
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .store_response_cookies(cookies, url);
+    impl SharedCookieJar {
+        /// Parse a `Set-Cookie` value and store it as received from `url`.
+        /// Mirrors `reqwest::cookie::Jar::add_cookie_str`, including its use of the
+        /// `cookie` crate for parsing (re-exported by `cookie_store`).
+        pub(crate) fn add_cookie_str(&self, cookie: &str, url: &Url) {
+            let cookies = cookie_store::RawCookie::parse(cookie)
+                .ok()
+                .map(|c| c.into_owned())
+                .into_iter();
+            self.store
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .store_response_cookies(cookies, url);
+        }
+
+        /// Build the `Cookie` request header for `url`. Mirrors `reqwest`'s
+        /// `Jar`: names/values joined with `"; "` in retrieval order.
+        pub(crate) fn cookies(&self, url: &Url) -> Option<HeaderValue> {
+            let s = self
+                .store
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_request_values(url)
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if s.is_empty() {
+                return None;
+            }
+            HeaderValue::from_str(&s).ok()
+        }
+
+        /// Run `f` with read access to the underlying store (Cookie Store API).
+        pub(crate) fn with_store<R>(&self, f: impl FnOnce(&cookie_store::CookieStore) -> R) -> R {
+            f(&self.store.read().unwrap_or_else(|e| e.into_inner()))
+        }
     }
 
-    /// Build the `Cookie` request header for `url`. Mirrors `reqwest`'s
-    /// `Jar`: names/values joined with `"; "` in retrieval order.
-    pub(crate) fn cookies(&self, url: &Url) -> Option<HeaderValue> {
-        let s = self
-            .store
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_request_values(url)
-            .map(|(name, value)| format!("{name}={value}"))
+    /// The global cookie jar shared by WHATWG `fetch()` clients. Cookies persist
+    /// across separate `fetch()` calls, matching the browser's per-origin cookie
+    /// store. The fetch path reads/writes it manually according to the request's
+    /// `credentials` mode.
+    pub(crate) fn global_cookie_jar() -> Arc<SharedCookieJar> {
+        static JAR: OnceLock<Arc<SharedCookieJar>> = OnceLock::new();
+        JAR.get_or_init(|| Arc::new(SharedCookieJar::default()))
+            .clone()
+    }
+
+    /// First-seen order of cookie names across the session, so the `Cookie` request
+    /// header lists cookies in creation order (WPT `cookies.any.js`). The
+    /// underlying `reqwest`/`cookie_store` jar returns cookies in hash order, which
+    /// does not match the creation order a browser UA cookie store preserves.
+    pub(crate) fn global_cookie_order() -> &'static std::sync::RwLock<Vec<String>> {
+        static ORDER: OnceLock<std::sync::RwLock<Vec<String>>> = OnceLock::new();
+        ORDER.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+    }
+
+    /// Record the name of a cookie being stored, so it keeps its creation position
+    /// in the `Cookie` header. The name is the token before the first `=` or `;`.
+    pub(crate) fn cookie_order_record(set_cookie: &str) {
+        let name = set_cookie
+            .split(['=', ';'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if name.is_empty() {
+            return;
+        }
+        let mut order = global_cookie_order().write().unwrap_or_else(|e| e.into_inner());
+        // Re-register on every `Set-Cookie`: move the name to the end rather than
+        // keeping its first-ever position. The table is process-global and never
+        // pruned, so a stale entry left by an earlier test or file would otherwise
+        // pin a name ahead of cookies set later, and a deleted cookie's name would
+        // keep its old slot (WPT `credentials/cookies` "Include mode: 2 cookies"
+        // expects the creation order of *this* response: `b=2; c=3`).
+        order.retain(|n| n != &name);
+        order.push(name);
+    }
+
+    /// Reorder a `Cookie` header value's `name=value` pairs into first-seen order.
+    /// Names not in the recorded order (e.g. overwritten/expired) are kept at the
+    /// end in their original relative order.
+    pub(crate) fn reorder_cookie_header(value: &str) -> String {
+        let order = global_cookie_order().read().unwrap_or_else(|e| e.into_inner());
+        let mut pairs: Vec<(usize, &str)> = value
+            .split("; ")
+            .map(|pair| {
+                let name = pair
+                    .split('=')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let pos = order.iter().position(|n| n == &name).unwrap_or(usize::MAX);
+                (pos, pair)
+            })
+            .collect();
+        pairs.sort_by_key(|(pos, _)| *pos);
+        pairs
+            .into_iter()
+            .map(|(_, pair)| pair)
             .collect::<Vec<_>>()
-            .join("; ");
-        if s.is_empty() {
-            return None;
-        }
-        HeaderValue::from_str(&s).ok()
-    }
-
-    /// Run `f` with read access to the underlying store (Cookie Store API).
-    #[cfg(feature = "fetch_cors_cookie")]
-    pub(crate) fn with_store<R>(&self, f: impl FnOnce(&cookie_store::CookieStore) -> R) -> R {
-        f(&self.store.read().unwrap_or_else(|e| e.into_inner()))
+            .join("; ")
     }
 }
 
-/// The global cookie jar shared by WHATWG `fetch()` clients. Cookies persist
-/// across separate `fetch()` calls, matching the browser's per-origin cookie
-/// store. The fetch path reads/writes it manually according to the request's
-/// `credentials` mode.
-pub(crate) fn global_cookie_jar() -> Arc<SharedCookieJar> {
-    static JAR: OnceLock<Arc<SharedCookieJar>> = OnceLock::new();
-    JAR.get_or_init(|| Arc::new(SharedCookieJar::default()))
-        .clone()
-}
-
-/// First-seen order of cookie names across the session, so the `Cookie` request
-/// header lists cookies in creation order (WPT `cookies.any.js`). The
-/// underlying `reqwest`/`cookie_store` jar returns cookies in hash order, which
-/// does not match the creation order a browser UA cookie store preserves.
-pub(crate) fn global_cookie_order() -> &'static std::sync::RwLock<Vec<String>> {
-    static ORDER: OnceLock<std::sync::RwLock<Vec<String>>> = OnceLock::new();
-    ORDER.get_or_init(|| std::sync::RwLock::new(Vec::new()))
-}
-
-/// Record the name of a cookie being stored, so it keeps its creation position
-/// in the `Cookie` header. The name is the token before the first `=` or `;`.
-pub(crate) fn cookie_order_record(set_cookie: &str) {
-    let name = set_cookie
-        .split(['=', ';'])
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if name.is_empty() {
-        return;
-    }
-    let mut order = global_cookie_order().write().unwrap_or_else(|e| e.into_inner());
-    // Re-register on every `Set-Cookie`: move the name to the end rather than
-    // keeping its first-ever position. The table is process-global and never
-    // pruned, so a stale entry left by an earlier test or file would otherwise
-    // pin a name ahead of cookies set later, and a deleted cookie's name would
-    // keep its old slot (WPT `credentials/cookies` "Include mode: 2 cookies"
-    // expects the creation order of *this* response: `b=2; c=3`).
-    order.retain(|n| n != &name);
-    order.push(name);
-}
-
-/// Reorder a `Cookie` header value's `name=value` pairs into first-seen order.
-/// Names not in the recorded order (e.g. overwritten/expired) are kept at the
-/// end in their original relative order.
-pub(crate) fn reorder_cookie_header(value: &str) -> String {
-    let order = global_cookie_order().read().unwrap_or_else(|e| e.into_inner());
-    let mut pairs: Vec<(usize, &str)> = value
-        .split("; ")
-        .map(|pair| {
-            let name = pair
-                .split('=')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            let pos = order.iter().position(|n| n == &name).unwrap_or(usize::MAX);
-            (pos, pair)
-        })
-        .collect();
-    pairs.sort_by_key(|(pos, _)| *pos);
-    pairs
-        .into_iter()
-        .map(|(_, pair)| pair)
-        .collect::<Vec<_>>()
-        .join("; ")
-}
+#[cfg(feature = "fetch_cors_cookie")]
+pub(crate) use cookie_jar_impl::{
+    cookie_order_record, global_cookie_jar, global_cookie_order, reorder_cookie_header,
+};
