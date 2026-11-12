@@ -395,109 +395,6 @@ async fn run_wpt_file(
         dep_sources.push((dep.display().to_string(), dep_code));
     }
 
-    let setup = r#"
-var G = (typeof globalThis !== 'undefined') ? globalThis : self;
-G.__wpt_results = [];
-G.__wpt_done = false;
-G.__wpt_result_cbs = [];
-G.__wpt_complete_cbs = [];
-// Minimal global EventTarget used by tests that observe uncaught exceptions
-// (`queueMicrotask`, timers). The real DOM EventTarget is not available here.
-G.__wpt_listeners = Object.create(null);
-G.addEventListener = function(type, cb){
-  if (!cb || (typeof cb !== 'function' && typeof cb.handleEvent !== 'function')) return;
-  (G.__wpt_listeners[type] || (G.__wpt_listeners[type] = [])).push(cb);
-};
-G.removeEventListener = function(type, cb){
-  var a = G.__wpt_listeners[type];
-  if (!a) return;
-  var i = a.indexOf(cb);
-  if (i >= 0) a.splice(i, 1);
-};
-G.dispatchEvent = function(ev){
-  var t = ev && ev.type;
-  var a = G.__wpt_listeners[t];
-  var ok = true;
-  if (a) {
-    a = a.slice();
-    for (var i = 0; i < a.length; i++) {
-      try {
-        var cb = a[i];
-        if (typeof cb === 'function') cb.call(G, ev);
-        else cb.handleEvent(ev);
-      } catch (e) { console.error(e); }
-    }
-  }
-  if (t === 'error' && typeof G.onerror === 'function') {
-    try {
-      if (G.onerror(ev.message, ev.filename, ev.lineno, ev.colno, ev.error) === false) ok = false;
-    } catch (e) {}
-  }
-  return ok;
-};
-// HTML "report an exception": used by queueMicrotask/timer callbacks.
-G.reportError = function(err){
-  G.dispatchEvent({
-    type: 'error', error: err,
-    message: (err && err.message !== undefined) ? String(err.message) : String(err),
-    filename: '', lineno: 0, colno: 0, cancelable: true
-  });
-};
-// File is a Blob subclass used by structured-clone/Blob WPTs; the crate does
-// not ship the File interface yet, so provide the minimal shape here.
-if (typeof G.File === 'undefined') {
-  G.File = class File extends Blob {
-    constructor(bits, name, opts) {
-      super(bits, opts);
-      this.name = String(name);
-      this.lastModified = (opts && opts.lastModified !== undefined)
-        ? Number(opts.lastModified) : Date.now();
-    }
-  };
-}
-G.add_result_callback = function(cb){
-  var wrapped = function(test){
-    try {
-      var pass = (test.status === 0);
-      G.__wpt_results.push({name:String(test.name||''), pass:!!pass, msg:String(test.message||'')});
-    } catch(e){}
-    try { cb(test); } catch(e){}
-  };
-  G.__wpt_result_cbs.push(wrapped);
-  return wrapped;
-};
-G.add_completion_callback = function(cb){
-  var wrapped = function(){
-    try { G.__wpt_done = true; } catch(e){}
-    try { cb(); } catch(e){}
-  };
-  G.__wpt_complete_cbs.push(wrapped);
-  return wrapped;
-};
-G.add_start_callback = function(cb){};
-"#;
-    let hook2 = r#"
-(function(){
-  var G = (typeof globalThis !== 'undefined') ? globalThis : self;
-  try {
-    if (typeof add_result_callback === 'function') {
-      add_result_callback(function(test){
-        var pass = (test.status === 0);
-        G.__wpt_results.push({name:String(test.name||''), pass:!!pass, msg:String(test.message||'')});
-      });
-    }
-    if (typeof add_completion_callback === 'function') {
-      add_completion_callback(function(){ G.__wpt_done = true; });
-    }
-  } catch(e) { G.__wpt_hook_err = String(e); }
-})();
-"#;
-    let finish = r#"
-try { if (typeof done === 'function') done(); } catch(e){}
-var Gf = (typeof globalThis!=='undefined')?globalThis:self;
-Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
-"#;
-
     let file_name = file.to_string_lossy().to_string();
 
     // Fresh context per file to avoid cross-file global redeclarations (closer to aike runner).
@@ -525,11 +422,17 @@ Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
     };
 
     let eval_err = ctx.with_root_scope(|mut cx| -> Result<(), String> {
-        eval_script(&mut cx, setup, "<wpt-setup>").map_err(|e| format!("setup: {e}"))?;
+        // Load shared comprehensive harness (single source of truth)
+        let sp = std::path::PathBuf::from("wpt-harness.js");
+        if sp.exists() {
+            if let Ok(st) = std::fs::read_to_string(&sp) {
+                let _ = eval_script_at(&mut cx, &st, "<wpt-harness>", Some(&doc_url));
+            }
+        }
         eval_script_at(&mut cx, testharness, "<testharness>", Some(&doc_url))
             .map_err(|e| format!("testharness: {e}"))?;
-        eval_script(&mut cx, hook2, "<wpt-hook2>").map_err(|e| format!("hook2: {e}"))?;
-        eval_script(&mut cx, &location_setup_script(&doc_url), "<wpt-location>")
+        let _ = eval_script_at(&mut cx, "if(typeof __wpt_hook2_fallback==='function'){try{__wpt_hook2_fallback();}catch(e){}}", "<wpt-hook2-fallback>", Some(&doc_url));
+        eval_script_at(&mut cx, &location_setup_script(&doc_url), "<wpt-location>", Some(&doc_url))
             .map_err(|e| format!("location: {e}"))?;
         // The WPT TLS fixtures use a self-signed certificate.
         eval_script(
@@ -544,7 +447,7 @@ Gf.__wpt_done = Gf.__wpt_done || (Gf.__wpt_results.length > 0);
         }
         eval_script_at(&mut cx, &format!("{code}\n"), &file_name, Some(&doc_url))
             .map_err(|e| format!("test: {e}"))?;
-        eval_script(&mut cx, finish, "<wpt-finish>").map_err(|e| format!("finish: {e}"))?;
+        let _ = eval_script_at(&mut cx, "if(typeof __wpt_finish==='function'){try{__wpt_finish();}catch(e){}}else{try{if(typeof done==='function')done();}catch(e){};var Gf=(typeof globalThis!=='undefined')?globalThis:self;Gf.__wpt_done=Gf.__wpt_done||(Gf.__wpt_results&&Gf.__wpt_results.length>0);}", "<wpt-finish>", Some(&doc_url));
         Ok(())
     });
     if let Err(e) = eval_err {
