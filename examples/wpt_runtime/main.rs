@@ -424,10 +424,15 @@ async fn run_wpt_file(
     let eval_err = ctx.with_root_scope(|mut cx| -> Result<(), String> {
         // Load shared comprehensive harness (single source of truth)
         let sp = std::path::PathBuf::from("wpt-harness.js");
-        if sp.exists() {
-            if let Ok(st) = std::fs::read_to_string(&sp) {
-                let _ = eval_script_at(&mut cx, &st, "<wpt-harness>", Some(&doc_url));
-            }
+        if !sp.exists() {
+            return Err("Failed to load wpt-harness.js: not found".to_string());
+        }
+        let st = match std::fs::read_to_string(&sp) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("Failed to load wpt-harness.js: {e}")),
+        };
+        if let Err(e) = eval_script_at(&mut cx, &st, "<wpt-harness>", Some(&doc_url)) {
+            return Err(format!("Failed to load wpt-harness.js: {e}"));
         }
         eval_script_at(&mut cx, testharness, "<testharness>", Some(&doc_url))
             .map_err(|e| format!("testharness: {e}"))?;
